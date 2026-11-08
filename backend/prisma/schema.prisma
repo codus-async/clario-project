@@ -1,0 +1,1465 @@
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model academic_sessions {
+  id                            String                          @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                          @db.Uuid
+  session_label                 String                          @db.VarChar(50)
+  start_date                    DateTime                        @db.Date
+  end_date                      DateTime                        @db.Date
+  status                        academic_session_status_enum    @default(UPCOMING)
+  closed_at                     DateTime?                       @db.Timestamptz(6)
+  closed_by_user_id             String?                         @db.Uuid
+  created_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  updated_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  institutions                  institutions                    @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  assessment_structures         assessment_structures[]
+  coordinator_appointments      coordinator_appointments[]
+  examination_panels            examination_panels[]
+  late_penalty_rules            late_penalty_rules[]
+  programme_milestones          programme_milestones[]
+  project_groups                project_groups[]
+  projects                      projects[]
+  student_project_registrations student_project_registrations[]
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, session_label])
+  @@index([institution_id, status, start_date(sort: Desc)], map: "idx_academic_sessions_inst_status")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model assessment_structures {
+  id                               String                    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                   String                    @db.Uuid
+  programme_id                     String                    @db.Uuid
+  academic_session_id              String                    @db.Uuid
+  total_max_marks                  Decimal                   @default(100.0000) @db.Decimal(10, 4)
+  supervisor_max_marks             Decimal                   @default(30.0000) @db.Decimal(10, 4)
+  examiner_document_max_marks      Decimal                   @default(40.0000) @db.Decimal(10, 4)
+  examiner_defence_max_marks       Decimal                   @default(30.0000) @db.Decimal(10, 4)
+  pass_mark_threshold              Decimal                   @default(45.0000) @db.Decimal(10, 4)
+  examiner_consolidation_method    consolidation_method_enum @default(ARITHMETIC_MEAN)
+  final_rounding_mode              rounding_mode_enum        @default(ROUND_HALF_UP_2DP)
+  supervisor_criteria_jsonb        Json
+  examiner_document_criteria_jsonb Json
+  examiner_defence_criteria_jsonb  Json
+  grade_scale_bands_jsonb          Json
+  supervisor_assessment_due_utc    DateTime?                 @db.Timestamptz(6)
+  is_locked                        Boolean                   @default(false)
+  updated_by_coordinator_id        String                    @db.Uuid
+  created_at                       DateTime                  @default(now()) @db.Timestamptz(6)
+  updated_at                       DateTime                  @default(now()) @db.Timestamptz(6)
+  academic_sessions                academic_sessions         @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                     institutions              @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                       programmes                @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, programme_id, academic_session_id])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model audit_logs {
+  id                               String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  sequence_num                     BigInt        @unique @default(autoincrement())
+  institution_id                   String?       @db.Uuid
+  programme_id                     String?       @db.Uuid
+  academic_session_id              String?       @db.Uuid
+  project_id                       String?       @db.Uuid
+  actor_user_id                    String?       @db.Uuid
+  actor_role                       String        @db.VarChar(50)
+  actor_ip                         String?       @db.Inet
+  action_code                      String        @db.VarChar(100)
+  is_confidential_academic_payload Boolean       @default(false)
+  target_entity_type               String        @db.VarChar(80)
+  target_entity_id                 String        @db.Uuid
+  previous_state_jsonb             Json?
+  resulting_state_jsonb            Json?
+  justification_reason             String?
+  outcome                          String        @db.VarChar(20)
+  previous_row_hash                String?       @db.Char(64)
+  row_integrity_hash               String        @db.Char(64)
+  created_at                       DateTime      @default(now()) @db.Timestamptz(6)
+  institutions                     institutions? @relation(fields: [institution_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([institution_id, target_entity_type, target_entity_id, created_at(sort: Desc)], map: "idx_audit_logs_entity_lookup")
+  @@index([institution_id, programme_id, academic_session_id, created_at(sort: Desc)], map: "idx_audit_logs_programme_scope")
+  @@index([institution_id, project_id, created_at(sort: Desc)], map: "idx_audit_logs_project_time", where: raw("(project_id IS NOT NULL)"))
+  @@index([institution_id, created_at(sort: Desc)], map: "idx_audit_logs_tenant_time")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model backup_recovery_logs {
+  id                       String    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  backup_type              String    @db.VarChar(40)
+  scope                    String    @default("ALL_STORES_DB_OBJECTS_AUDIT") @db.VarChar(60)
+  started_at               DateTime  @default(now()) @db.Timestamptz(6)
+  completed_at             DateTime? @db.Timestamptz(6)
+  backup_size_bytes        BigInt?
+  encryption_key_id        String    @db.VarChar(120)
+  sha256_manifest_checksum String?   @db.Char(64)
+  retention_expires_at     DateTime  @default(dbgenerated("(now() + '30 days'::interval)")) @db.Timestamptz(6)
+  measured_rto_minutes     Int?
+  status                   String    @db.VarChar(30)
+  error_details            String?
+
+  @@index([status, started_at(sort: Desc)], map: "idx_backup_logs_status_time")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model consolidated_student_results {
+  id                                  String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                      String                        @db.Uuid
+  programme_id                        String                        @db.Uuid
+  academic_session_id                 String                        @db.Uuid
+  project_id                          String                        @db.Uuid
+  student_registration_id             String                        @unique @db.Uuid
+  student_user_id                     String                        @db.Uuid
+  consolidated_examiner_doc_score     Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  consolidated_examiner_defence_score Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  consolidated_examiner_total_score   Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  individual_supervisor_score         Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  gross_score                         Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  effective_late_penalty              Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  net_unrounded_score                 Decimal                       @default(0.0000) @db.Decimal(10, 4)
+  final_rounded_score                 Decimal                       @default(0.00) @db.Decimal(10, 2)
+  letter_grade                        String                        @db.VarChar(10)
+  academic_outcome                    academic_outcome_enum
+  consolidation_method_used           consolidation_method_enum
+  is_published                        Boolean                       @default(false)
+  published_at                        DateTime?                     @db.Timestamptz(6)
+  published_by_coordinator_id         String?                       @db.Uuid
+  cond_topic_approved                 Boolean                       @default(false)
+  cond_interim_milestones_approved    Boolean                       @default(false)
+  cond_final_submission_approved      Boolean                       @default(false)
+  cond_assessments_completed          Boolean                       @default(false)
+  cond_result_published_and_passed    Boolean                       @default(false)
+  consolidated_at                     DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                          DateTime                      @default(now()) @db.Timestamptz(6)
+  institutions                        institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                            projects                      @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  student_project_registrations       student_project_registrations @relation(fields: [institution_id, student_registration_id], references: [institution_id, id], onUpdate: NoAction)
+  users                               users                         @relation(fields: [institution_id, student_user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([project_id, student_user_id])
+  @@index([institution_id, programme_id, academic_session_id, is_published], map: "idx_consolidated_results_cohort")
+  @@index([institution_id, project_id], map: "idx_consolidated_results_project")
+  @@index([institution_id, student_user_id, is_published], map: "idx_consolidated_results_student")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model coordinator_appointments {
+  id                   String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id       String                      @db.Uuid
+  user_id              String                      @db.Uuid
+  programme_id         String                      @db.Uuid
+  academic_session_id  String                      @db.Uuid
+  status               academic_entity_status_enum @default(ACTIVE)
+  appointed_by_user_id String                      @db.Uuid
+  appointed_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  revoked_at           DateTime?                   @db.Timestamptz(6)
+  revocation_reason    String?                     @db.VarChar(500)
+  academic_sessions    academic_sessions           @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions         institutions                @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes           programmes                  @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  users                users                       @relation(fields: [institution_id, user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, user_id, programme_id, academic_session_id], map: "idx_coord_active_unique", where: raw("(status = 'ACTIVE'::academic_entity_status_enum)"))
+  @@index([institution_id, programme_id, academic_session_id, status], map: "idx_coord_appt_prog_session")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model deadline_extension_requests {
+  id                                  String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                      String                        @db.Uuid
+  programme_id                        String                        @db.Uuid
+  academic_session_id                 String                        @db.Uuid
+  project_id                          String                        @db.Uuid
+  milestone_id                        String                        @db.Uuid
+  original_effective_deadline_utc     DateTime                      @db.Timestamptz(6)
+  requested_new_deadline_utc          DateTime                      @db.Timestamptz(6)
+  student_reason                      String
+  supporting_evidence_object_id       String?                       @db.Uuid
+  requested_by_user_id                String                        @db.Uuid
+  requested_at                        DateTime                      @default(now()) @db.Timestamptz(6)
+  status                              extension_request_status_enum @default(PENDING_SUPERVISOR_RECOMMENDATION)
+  supervisor_user_id                  String?                       @db.Uuid
+  supervisor_recommended_deadline_utc DateTime?                     @db.Timestamptz(6)
+  supervisor_comments                 String?
+  supervisor_decided_at               DateTime?                     @db.Timestamptz(6)
+  coordinator_user_id                 String?                       @db.Uuid
+  approved_extended_deadline_utc      DateTime?                     @db.Timestamptz(6)
+  coordinator_comments                String?
+  coordinator_decided_at              DateTime?                     @db.Timestamptz(6)
+  institutions                        institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programme_milestones                programme_milestones          @relation(fields: [institution_id, milestone_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                            projects                      @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  storage_objects                     storage_objects?              @relation(fields: [institution_id, supporting_evidence_object_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@index([institution_id, programme_id, academic_session_id, status], map: "idx_ext_requests_coord_pending", where: raw("(status = 'RECOMMENDED_PENDING_COORDINATOR'::extension_request_status_enum)"))
+  @@index([institution_id, project_id, milestone_id], map: "idx_ext_requests_project")
+  @@index([institution_id, supervisor_user_id, status], map: "idx_ext_requests_sup_pending", where: raw("(status = 'PENDING_SUPERVISOR_RECOMMENDATION'::extension_request_status_enum)"))
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model defence_schedules {
+  id                          String                       @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id              String                       @db.Uuid
+  programme_id                String                       @db.Uuid
+  academic_session_id         String                       @db.Uuid
+  project_id                  String                       @unique @db.Uuid
+  panel_id                    String?                      @db.Uuid
+  defence_date                DateTime                     @db.Date
+  start_time_utc              DateTime                     @db.Timestamptz(6)
+  end_time_utc                DateTime                     @db.Timestamptz(6)
+  venue_location              String                       @db.VarChar(250)
+  instructions_notes          String?
+  status                      defence_schedule_status_enum @default(SCHEDULED)
+  scheduled_by_coordinator_id String                       @db.Uuid
+  created_at                  DateTime                     @default(now()) @db.Timestamptz(6)
+  updated_at                  DateTime                     @default(now()) @db.Timestamptz(6)
+  institutions                institutions                 @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  examination_panels          examination_panels?          @relation(fields: [institution_id, panel_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                    projects                     @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, id])
+  @@index([institution_id, panel_id], map: "idx_defence_schedules_panel_fk", where: raw("(panel_id IS NOT NULL)"))
+  @@index([institution_id, programme_id, academic_session_id, defence_date, start_time_utc], map: "idx_defence_schedules_scope_date")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model departments {
+  id                 String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id     String                      @db.Uuid
+  faculty_id         String                      @db.Uuid
+  name               String                      @db.VarChar(150)
+  code               String                      @db.Citext
+  description        String?
+  status             academic_entity_status_enum @default(ACTIVE)
+  created_by_user_id String?                     @db.Uuid
+  created_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  faculties          faculties                   @relation(fields: [institution_id, faculty_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions       institutions                @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes         programmes[]
+  supervisor_records supervisor_records[]
+
+  @@unique([institution_id, code])
+  @@unique([institution_id, id])
+  @@index([institution_id, faculty_id, status], map: "idx_departments_inst_faculty")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model examination_panels {
+  id                        String                  @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id            String                  @db.Uuid
+  programme_id              String                  @db.Uuid
+  academic_session_id       String                  @db.Uuid
+  panel_name                String                  @db.VarChar(120)
+  required_examiner_count   Int                     @default(1)
+  created_by_coordinator_id String                  @db.Uuid
+  created_at                DateTime                @default(now()) @db.Timestamptz(6)
+  defence_schedules         defence_schedules[]
+  academic_sessions         academic_sessions       @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions              institutions            @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                programmes              @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  examiner_appointments     examiner_appointments[]
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, programme_id, academic_session_id, panel_name])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model examiner_appointments {
+  id                          String                           @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id              String                           @db.Uuid
+  programme_id                String                           @db.Uuid
+  academic_session_id         String                           @db.Uuid
+  project_id                  String                           @db.Uuid
+  panel_id                    String?                          @db.Uuid
+  examiner_user_id            String                           @db.Uuid
+  status                      examiner_appointment_status_enum @default(ACTIVE)
+  appointed_by_coordinator_id String                           @db.Uuid
+  appointed_at                DateTime                         @default(now()) @db.Timestamptz(6)
+  removed_at                  DateTime?                        @db.Timestamptz(6)
+  removal_reason              String?                          @db.VarChar(500)
+  users                       users                            @relation(fields: [institution_id, examiner_user_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                institutions                     @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  examination_panels          examination_panels?              @relation(fields: [institution_id, panel_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                    projects                         @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  examiner_assessments        examiner_assessments[]
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, project_id, examiner_user_id], map: "idx_active_examiner_per_project", where: raw("(status = 'ACTIVE'::examiner_appointment_status_enum)"))
+  @@index([institution_id, panel_id], map: "idx_examiner_appt_panel_fk", where: raw("(panel_id IS NOT NULL)"))
+  @@index([institution_id, examiner_user_id, status], map: "idx_examiner_appt_user_lookup")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model examiner_assessments {
+  id                                    String                            @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                        String                            @db.Uuid
+  project_id                            String                            @db.Uuid
+  examiner_appointment_id               String                            @unique @db.Uuid
+  examiner_user_id                      String                            @db.Uuid
+  evaluated_final_submission_version_id String?                           @db.Uuid
+  document_criterion_scores_jsonb       Json                              @default("[]")
+  document_subtotal_score               Decimal                           @default(0.0000) @db.Decimal(10, 4)
+  defence_criterion_scores_jsonb        Json                              @default("[]")
+  defence_subtotal_score                Decimal                           @default(0.0000) @db.Decimal(10, 4)
+  examiner_total_score                  Decimal                           @default(0.0000) @db.Decimal(10, 4)
+  formal_examination_feedback           String?
+  status                                assessment_submission_status_enum @default(PENDING)
+  revision_number                       Int                               @default(1)
+  edit_reason                           String?                           @db.VarChar(500)
+  submitted_at                          DateTime?                         @db.Timestamptz(6)
+  last_edited_at                        DateTime?                         @db.Timestamptz(6)
+  created_at                            DateTime                          @default(now()) @db.Timestamptz(6)
+  updated_at                            DateTime                          @default(now()) @db.Timestamptz(6)
+  examiner_appointments                 examiner_appointments             @relation(fields: [institution_id, examiner_appointment_id], references: [institution_id, id], onUpdate: NoAction)
+  users                                 users                             @relation(fields: [institution_id, examiner_user_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                          institutions                      @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                              projects                          @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@index([institution_id, examiner_user_id, status], map: "idx_examiner_assessments_examiner")
+  @@index([institution_id, project_id, status], map: "idx_examiner_assessments_project")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model faculties {
+  id                 String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id     String                      @db.Uuid
+  name               String                      @db.VarChar(150)
+  code               String                      @db.Citext
+  description        String?
+  status             academic_entity_status_enum @default(ACTIVE)
+  created_by_user_id String?                     @db.Uuid
+  created_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  departments        departments[]
+  institutions       institutions                @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes         programmes[]
+
+  @@unique([institution_id, code])
+  @@unique([institution_id, id])
+}
+
+model in_app_notifications {
+  id                String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id    String?       @db.Uuid
+  recipient_user_id String        @db.Uuid
+  event_type_code   String        @db.VarChar(80)
+  title             String        @db.VarChar(200)
+  body              String
+  target_deep_link  String        @db.VarChar(300)
+  is_read           Boolean       @default(false)
+  read_at           DateTime?     @db.Timestamptz(6)
+  created_at        DateTime      @default(now()) @db.Timestamptz(6)
+  institutions      institutions? @relation(fields: [institution_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users             users         @relation(fields: [recipient_user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([recipient_user_id, is_read, created_at(sort: Desc)], map: "idx_in_app_notif_recipient")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model institutional_subscriptions {
+  id                         String                   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id             String                   @unique @db.Uuid
+  plan_id                    String                   @db.Uuid
+  contracted_price_kobo      BigInt
+  contracted_max_users       Int
+  subscription_status        subscription_status_enum @default(PENDING_PAYMENT)
+  current_period_start       DateTime?                @db.Timestamptz(6)
+  current_period_end         DateTime?                @db.Timestamptz(6)
+  override_grace_period_days Int?
+  override_justification     String?                  @db.VarChar(300)
+  grace_period_end           DateTime?                @db.Timestamptz(6)
+  billing_legal_name         String                   @db.VarChar(200)
+  billing_email              String                   @db.Citext
+  billing_address            String?
+  tax_rc_number              String?                  @db.VarChar(60)
+  billing_contact_phone      String?                  @db.VarChar(30)
+  created_at                 DateTime                 @default(now()) @db.Timestamptz(6)
+  updated_at                 DateTime                 @default(now()) @db.Timestamptz(6)
+  institutions               institutions             @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  subscription_plans         subscription_plans       @relation(fields: [plan_id], references: [id], onUpdate: NoAction)
+  payment_transactions       payment_transactions[]
+
+  @@index([plan_id], map: "idx_inst_subscriptions_plan_fk")
+  @@index([subscription_status, current_period_end, grace_period_end], map: "idx_inst_subscriptions_status_end")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model institutions {
+  id                              String                            @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  name                            String                            @db.VarChar(150)
+  code_slug                       String                            @unique @db.Citext
+  country                         String                            @default("Nigeria") @db.VarChar(60)
+  timezone_iana                   String                            @default("Africa/Lagos") @db.VarChar(64)
+  primary_contact_name            String                            @db.VarChar(120)
+  primary_contact_email           String                            @db.Citext
+  primary_contact_phone           String?                           @db.VarChar(30)
+  account_status                  tenant_status_enum                @default(PENDING_ACTIVATION)
+  status_change_reason            String?                           @db.VarChar(500)
+  termination_initiated_at        DateTime?                         @db.Timestamptz(6)
+  termination_recovery_days       Int                               @default(90)
+  created_by_actor_id             String?                           @db.Uuid
+  updated_by_actor_id             String?                           @db.Uuid
+  created_at                      DateTime                          @default(now()) @db.Timestamptz(6)
+  updated_at                      DateTime                          @default(now()) @db.Timestamptz(6)
+  academic_sessions               academic_sessions[]
+  assessment_structures           assessment_structures[]
+  audit_logs                      audit_logs[]
+  consolidated_student_results    consolidated_student_results[]
+  coordinator_appointments        coordinator_appointments[]
+  deadline_extension_requests     deadline_extension_requests[]
+  defence_schedules               defence_schedules[]
+  departments                     departments[]
+  examination_panels              examination_panels[]
+  examiner_appointments           examiner_appointments[]
+  examiner_assessments            examiner_assessments[]
+  faculties                       faculties[]
+  in_app_notifications            in_app_notifications[]
+  institutional_subscriptions     institutional_subscriptions?
+  late_penalty_rules              late_penalty_rules[]
+  notification_dispatch_jobs      notification_dispatch_jobs[]
+  payment_transactions            payment_transactions[]
+  programme_milestones            programme_milestones[]
+  programmes                      programmes[]
+  project_group_members           project_group_members[]
+  project_groups                  project_groups[]
+  project_late_penalties          project_late_penalties[]
+  project_milestone_states        project_milestone_states[]
+  project_supervision_history     project_supervision_history[]
+  projects                        projects[]
+  scheduled_deadline_jobs         scheduled_deadline_jobs[]
+  shared_group_document_revisions shared_group_document_revisions[]
+  shared_group_documents          shared_group_documents[]
+  storage_objects                 storage_objects[]
+  student_project_registrations   student_project_registrations[]
+  submission_discussions          submission_discussions[]
+  submission_versions             submission_versions[]
+  supervisor_assessments          supervisor_assessments[]
+  supervisor_records              supervisor_records[]
+  topic_proposals                 topic_proposals[]
+  transactional_outbox_events     transactional_outbox_events[]
+  user_role_assignments           user_role_assignments[]
+  user_sessions                   user_sessions[]
+  users                           users[]
+
+  @@index([account_status], map: "idx_institutions_status")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model late_penalty_rules {
+  id                        String                 @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id            String                 @db.Uuid
+  programme_id              String                 @db.Uuid
+  academic_session_id       String                 @db.Uuid
+  penalties_enabled         Boolean                @default(false)
+  grace_buffer_minutes      Int                    @default(0)
+  calculation_mode          late_penalty_mode_enum @default(DISABLED_ADVISORY_ONLY)
+  penalty_rate_per_unit     Decimal                @default(0.0000) @db.Decimal(10, 4)
+  max_penalty_cap           Decimal                @default(0.0000) @db.Decimal(10, 4)
+  updated_by_coordinator_id String                 @db.Uuid
+  updated_at                DateTime               @default(now()) @db.Timestamptz(6)
+  academic_sessions         academic_sessions      @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions              institutions           @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                programmes             @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, programme_id, academic_session_id])
+}
+
+model notification_dispatch_jobs {
+  id                  String                    @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id      String?                   @db.Uuid
+  source_event_id     String                    @db.Uuid
+  recipient_user_id   String                    @db.Uuid
+  channel             notification_channel_enum
+  idempotency_key     String                    @unique @db.VarChar(180)
+  template_code       String                    @db.VarChar(80)
+  subject             String?                   @db.VarChar(250)
+  payload_jsonb       Json
+  status              dispatch_status_enum      @default(PENDING)
+  attempt_count       Int                       @default(0)
+  max_attempts        Int                       @default(5)
+  next_retry_at       DateTime?                 @db.Timestamptz(6)
+  provider_message_id String?                   @db.VarChar(150)
+  last_error_message  String?
+  created_at          DateTime                  @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime                  @default(now()) @db.Timestamptz(6)
+  institutions        institutions?             @relation(fields: [institution_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users               users                     @relation(fields: [recipient_user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([status, next_retry_at], map: "idx_dispatch_jobs_retry", where: raw("(status = ANY (ARRAY['PENDING'::dispatch_status_enum, 'RETRY_SCHEDULED'::dispatch_status_enum]))"))
+  @@index([recipient_user_id, created_at(sort: Desc)], map: "idx_notif_dispatch_recipient")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model payment_transactions {
+  id                          String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id              String                      @db.Uuid
+  subscription_id             String                      @db.Uuid
+  plan_id                     String                      @db.Uuid
+  idempotency_reference       String                      @unique @db.VarChar(100)
+  currency                    String                      @default("NGN") @db.Char(3)
+  expected_amount_kobo        BigInt
+  paid_amount_kobo            BigInt?
+  gateway_provider            String                      @default("PAYSTACK_OR_CONFIGURED_PROVIDER") @db.VarChar(40)
+  gateway_checkout_session_id String?                     @db.VarChar(120)
+  status                      payment_tx_status_enum      @default(INITIATED)
+  initiated_by_user_id        String                      @db.Uuid
+  initiated_at                DateTime                    @default(now()) @db.Timestamptz(6)
+  verified_at                 DateTime?                   @db.Timestamptz(6)
+  failure_reason              String?
+  institutions                institutions                @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  subscription_plans          subscription_plans          @relation(fields: [plan_id], references: [id], onUpdate: NoAction)
+  institutional_subscriptions institutional_subscriptions @relation(fields: [subscription_id], references: [id], onUpdate: NoAction)
+  payment_webhook_events      payment_webhook_events[]
+
+  @@index([institution_id, status, initiated_at(sort: Desc)], map: "idx_payment_tx_inst_status")
+  @@index([institution_id, initiated_at(sort: Desc)], map: "idx_payment_tx_institution")
+  @@index([subscription_id], map: "idx_payment_tx_sub_fk")
+}
+
+model payment_webhook_events {
+  id                    String                         @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  gateway_event_id      String                         @unique @db.VarChar(120)
+  idempotency_reference String?                        @db.VarChar(100)
+  event_type            String                         @db.VarChar(80)
+  signature_verified    Boolean                        @default(false)
+  processing_status     webhook_processing_status_enum @default(RECEIVED)
+  raw_payload_sha256    String                         @db.Char(64)
+  raw_payload_jsonb     Json
+  received_at           DateTime                       @default(now()) @db.Timestamptz(6)
+  processed_at          DateTime?                      @db.Timestamptz(6)
+  error_message         String?
+  payment_transactions  payment_transactions?          @relation(fields: [idempotency_reference], references: [idempotency_reference], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([processing_status, received_at], map: "idx_webhook_events_status", where: raw("(processing_status = ANY (ARRAY['RECEIVED'::webhook_processing_status_enum, 'FAILED'::webhook_processing_status_enum]))"))
+  @@index([idempotency_reference], map: "idx_webhook_events_tx_ref_fk")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model platform_subscription_settings {
+  id                             Int      @id @default(1)
+  default_grace_period_days      Int      @default(14)
+  grace_period_permissions_jsonb Json     @default("{\"show_warning_banner\": true, \"allow_academic_writes\": true}")
+  expired_permissions_jsonb      Json     @default("{\"allow_academic_reads\": true, \"allow_billing_portal\": true, \"allow_academic_writes\": false}")
+  updated_by_actor_id            String?  @db.Uuid
+  updated_at                     DateTime @default(now()) @db.Timestamptz(6)
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model programme_milestones {
+  id                           String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id               String                        @db.Uuid
+  programme_id                 String                        @db.Uuid
+  academic_session_id          String                        @db.Uuid
+  sequence_number              Int
+  title                        String                        @db.VarChar(150)
+  milestone_type               milestone_type_enum           @default(INTERIM)
+  description_and_requirements String
+  permitted_extensions         String[]                      @default(["pdf", "doc", "docx", "ppt", "pptx"])
+  programme_deadline_utc       DateTime                      @db.Timestamptz(6)
+  created_by_coordinator_id    String                        @db.Uuid
+  created_at                   DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                   DateTime                      @default(now()) @db.Timestamptz(6)
+  deadline_extension_requests  deadline_extension_requests[]
+  academic_sessions            academic_sessions             @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                 institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                   programmes                    @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  project_milestone_states     project_milestone_states[]
+  submission_versions          submission_versions[]
+
+  @@unique([institution_id, programme_id, academic_session_id], map: "idx_one_final_milestone_per_prog", where: raw("(milestone_type = 'FINAL_SUBMISSION'::milestone_type_enum)"))
+  @@unique([institution_id, id])
+  @@unique([institution_id, programme_id, academic_session_id, title], map: "programme_milestones_institution_id_programme_id_academic__key1")
+  @@unique([institution_id, programme_id, academic_session_id, sequence_number])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+/// This model contains an expression index which requires additional setup for migrations. Visit https://pris.ly/d/expression-indexes for more info.
+model programmes {
+  id                            String                          @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                          @db.Uuid
+  faculty_id                    String                          @db.Uuid
+  department_id                 String                          @db.Uuid
+  name                          String                          @db.VarChar(150)
+  code                          String                          @db.Citext
+  degree_award_title            String?                         @db.VarChar(40)
+  project_guidelines_markdown   String?
+  status                        academic_entity_status_enum     @default(ACTIVE)
+  created_by_user_id            String?                         @db.Uuid
+  created_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  updated_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  assessment_structures         assessment_structures[]
+  coordinator_appointments      coordinator_appointments[]
+  examination_panels            examination_panels[]
+  late_penalty_rules            late_penalty_rules[]
+  programme_milestones          programme_milestones[]
+  departments                   departments                     @relation(fields: [institution_id, department_id], references: [institution_id, id], onUpdate: NoAction)
+  faculties                     faculties                       @relation(fields: [institution_id, faculty_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                  institutions                    @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  project_groups                project_groups[]
+  projects                      projects[]
+  student_project_registrations student_project_registrations[]
+
+  @@unique([institution_id, code])
+  @@unique([institution_id, id])
+  @@index([institution_id, department_id, status], map: "idx_programmes_inst_dept")
+  @@index([institution_id, faculty_id, status], map: "idx_programmes_inst_faculty")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model project_group_members {
+  id                            String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                        @db.Uuid
+  group_id                      String                        @db.Uuid
+  project_id                    String                        @db.Uuid
+  student_registration_id       String                        @unique @db.Uuid
+  student_user_id               String                        @db.Uuid
+  is_designated_submitter       Boolean                       @default(false)
+  member_status                 academic_entity_status_enum   @default(ACTIVE)
+  designated_by_coordinator_id  String                        @db.Uuid
+  joined_at                     DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                    DateTime                      @default(now()) @db.Timestamptz(6)
+  institutions                  institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  project_groups                project_groups                @relation(fields: [institution_id, group_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                      projects                      @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  student_project_registrations student_project_registrations @relation(fields: [institution_id, student_registration_id], references: [institution_id, id], onUpdate: NoAction)
+  users                         users                         @relation(fields: [institution_id, student_user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([group_id, student_user_id])
+  @@index([institution_id, student_user_id, member_status], map: "idx_group_members_student_lookup")
+  @@index([institution_id, project_id, student_user_id, is_designated_submitter], map: "idx_group_members_submitter", where: raw("(member_status = 'ACTIVE'::academic_entity_status_enum)"))
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model project_groups {
+  id                            String                          @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                          @db.Uuid
+  programme_id                  String                          @db.Uuid
+  academic_session_id           String                          @db.Uuid
+  project_id                    String                          @unique @db.Uuid
+  group_code                    String                          @db.VarChar(100)
+  created_by_coordinator_id     String                          @db.Uuid
+  created_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  updated_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  project_group_members         project_group_members[]
+  academic_sessions             academic_sessions               @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                  institutions                    @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                    programmes                      @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                      projects                        @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  shared_group_documents        shared_group_documents[]
+  student_project_registrations student_project_registrations[]
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, programme_id, academic_session_id, group_code])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model project_late_penalties {
+  id                           String              @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id               String              @db.Uuid
+  project_id                   String              @db.Uuid
+  submission_version_id        String              @unique @db.Uuid
+  late_duration_minutes        Int
+  calculated_penalty_marks     Decimal             @default(0.0000) @db.Decimal(10, 4)
+  is_overridden                Boolean             @default(false)
+  overridden_penalty_marks     Decimal?            @db.Decimal(10, 4)
+  effective_penalty_marks      Decimal             @default(0.0000) @db.Decimal(10, 4)
+  override_reason              String?             @db.VarChar(1000)
+  overridden_by_coordinator_id String?             @db.Uuid
+  overridden_at                DateTime?           @db.Timestamptz(6)
+  created_at                   DateTime            @default(now()) @db.Timestamptz(6)
+  institutions                 institutions        @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                     projects            @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  submission_versions          submission_versions @relation(fields: [institution_id, submission_version_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@index([institution_id, project_id], map: "idx_proj_late_penalties_project")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model project_milestone_states {
+  id                     String                       @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id         String                       @db.Uuid
+  project_id             String                       @db.Uuid
+  milestone_id           String                       @db.Uuid
+  sequence_number        Int
+  progress_state         project_milestone_state_enum @default(LOCKED)
+  effective_deadline_utc DateTime                     @db.Timestamptz(6)
+  is_overdue             Boolean                      @default(false)
+  overdue_detected_at    DateTime?                    @db.Timestamptz(6)
+  latest_version_number  Int                          @default(0)
+  approved_version_id    String?                      @db.Uuid
+  approved_at            DateTime?                    @db.Timestamptz(6)
+  updated_at             DateTime                     @default(now()) @db.Timestamptz(6)
+  institutions           institutions                 @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programme_milestones   programme_milestones         @relation(fields: [institution_id, milestone_id], references: [institution_id, id], onUpdate: NoAction)
+  projects               projects                     @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  submission_versions    submission_versions[]
+
+  @@unique([institution_id, id])
+  @@unique([project_id, milestone_id])
+  @@unique([project_id, sequence_number])
+  @@index([institution_id, project_id, sequence_number], map: "idx_proj_milestone_inst_proj_seq")
+  @@index([institution_id, milestone_id], map: "idx_proj_milestone_milestone_fk")
+  @@index([effective_deadline_utc, progress_state, is_overdue], map: "idx_proj_milestone_overdue_scan")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model project_supervision_history {
+  id                         String                             @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id             String                             @db.Uuid
+  programme_id               String                             @db.Uuid
+  academic_session_id        String                             @db.Uuid
+  project_id                 String                             @db.Uuid
+  supervisor_user_id         String                             @db.Uuid
+  supervisor_record_id       String                             @db.Uuid
+  assignment_status          supervision_assignment_status_enum @default(ACTIVE)
+  assigned_by_coordinator_id String                             @db.Uuid
+  assigned_at                DateTime                           @default(now()) @db.Timestamptz(6)
+  ended_at                   DateTime?                          @db.Timestamptz(6)
+  ended_by_coordinator_id    String?                            @db.Uuid
+  reassignment_reason        String?                            @db.VarChar(500)
+  institutions               institutions                       @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                   projects                           @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  supervisor_records         supervisor_records                 @relation(fields: [institution_id, supervisor_record_id], references: [institution_id, id], onUpdate: NoAction)
+  users                      users                              @relation(fields: [institution_id, supervisor_user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, project_id], map: "idx_one_active_supervisor_per_project", where: raw("(assignment_status = 'ACTIVE'::supervision_assignment_status_enum)"))
+  @@index([institution_id, project_id, supervisor_user_id], map: "idx_supervision_history_lookup")
+  @@index([institution_id, supervisor_record_id], map: "idx_supervision_history_rec_fk")
+  @@index([institution_id, supervisor_user_id, assignment_status], map: "idx_supervision_history_sup_user")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model projects {
+  id                            String                          @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                          @db.Uuid
+  programme_id                  String                          @db.Uuid
+  academic_session_id           String                          @db.Uuid
+  project_type                  project_type_enum
+  approved_topic_title          String?                         @db.VarChar(300)
+  current_supervisor_user_id    String?                         @db.Uuid
+  required_examiner_panel_size  Int                             @default(1)
+  lifecycle_status              project_lifecycle_status_enum   @default(TOPIC_PROPOSAL)
+  result_approval_status        result_approval_status_enum     @default(INCOMPLETE_ASSESSMENTS)
+  approved_by_coordinator_id    String?                         @db.Uuid
+  approved_at                   DateTime?                       @db.Timestamptz(6)
+  published_by_coordinator_id   String?                         @db.Uuid
+  published_at                  DateTime?                       @db.Timestamptz(6)
+  created_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  updated_at                    DateTime                        @default(now()) @db.Timestamptz(6)
+  consolidated_student_results  consolidated_student_results[]
+  deadline_extension_requests   deadline_extension_requests[]
+  defence_schedules             defence_schedules[]
+  examiner_appointments         examiner_appointments[]
+  examiner_assessments          examiner_assessments[]
+  project_group_members         project_group_members[]
+  project_groups                project_groups[]
+  project_late_penalties        project_late_penalties[]
+  project_milestone_states      project_milestone_states[]
+  project_supervision_history   project_supervision_history?
+  academic_sessions             academic_sessions               @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  users                         users?                          @relation(fields: [institution_id, current_supervisor_user_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                  institutions                    @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programmes                    programmes                      @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  scheduled_deadline_jobs       scheduled_deadline_jobs[]
+  shared_group_documents        shared_group_documents[]
+  storage_objects               storage_objects[]
+  student_project_registrations student_project_registrations[]
+  submission_discussions        submission_discussions[]
+  submission_versions           submission_versions[]
+  supervisor_assessments        supervisor_assessments[]
+  topic_proposals               topic_proposals[]
+
+  @@unique([institution_id, id])
+  @@index([institution_id, programme_id, academic_session_id, result_approval_status], map: "idx_projects_approval_scope")
+  @@index([institution_id, programme_id, academic_session_id, lifecycle_status], map: "idx_projects_scope")
+  @@index([institution_id, current_supervisor_user_id], map: "idx_projects_supervisor")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model scheduled_deadline_jobs {
+  id                     String       @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id         String       @db.Uuid
+  project_id             String       @db.Uuid
+  milestone_id           String       @db.Uuid
+  effective_deadline_utc DateTime     @db.Timestamptz(6)
+  job_type               String       @db.VarChar(40)
+  scheduled_trigger_utc  DateTime     @db.Timestamptz(6)
+  status                 String       @default("SCHEDULED") @db.VarChar(40)
+  executed_at            DateTime?    @db.Timestamptz(6)
+  institutions           institutions @relation(fields: [institution_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  projects               projects     @relation(fields: [institution_id, project_id], references: [institution_id, id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([project_id, milestone_id, effective_deadline_utc, job_type])
+  @@index([scheduled_trigger_utc, status], map: "idx_scheduled_deadline_due", where: raw("((status)::text = 'SCHEDULED'::text)"))
+  @@index([institution_id, project_id, milestone_id, status], map: "idx_scheduled_deadline_proj_lookup")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model shared_group_document_revisions {
+  id                     String                 @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id         String                 @db.Uuid
+  shared_document_id     String                 @db.Uuid
+  revision_number        Int
+  storage_object_id      String                 @unique @db.Uuid
+  uploaded_by_user_id    String                 @db.Uuid
+  revision_notes         String?                @db.VarChar(500)
+  created_at             DateTime               @default(now()) @db.Timestamptz(6)
+  shared_group_documents shared_group_documents @relation(fields: [institution_id, shared_document_id], references: [institution_id, id], onUpdate: NoAction, map: "shared_group_document_revisio_institution_id_shared_docume_fkey")
+  storage_objects        storage_objects        @relation(fields: [institution_id, storage_object_id], references: [institution_id, id], onUpdate: NoAction, map: "shared_group_document_revisio_institution_id_storage_objec_fkey")
+  institutions           institutions           @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+
+  @@unique([shared_document_id, revision_number], map: "shared_group_document_revisio_shared_document_id_revision_n_key")
+  @@index([institution_id, shared_document_id, revision_number(sort: Desc)], map: "idx_shared_group_doc_revs_lookup")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model shared_group_documents {
+  id                              String                            @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                  String                            @db.Uuid
+  group_id                        String                            @db.Uuid
+  project_id                      String                            @db.Uuid
+  document_title                  String                            @db.VarChar(150)
+  target_milestone_id             String?                           @db.Uuid
+  current_revision_number         Int                               @default(1)
+  latest_storage_object_id        String                            @db.Uuid
+  last_uploaded_by_user_id        String                            @db.Uuid
+  status                          academic_entity_status_enum       @default(ACTIVE)
+  created_at                      DateTime                          @default(now()) @db.Timestamptz(6)
+  updated_at                      DateTime                          @default(now()) @db.Timestamptz(6)
+  shared_group_document_revisions shared_group_document_revisions[]
+  institutions                    institutions                      @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  project_groups                  project_groups                    @relation(fields: [institution_id, group_id], references: [institution_id, id], onUpdate: NoAction)
+  storage_objects                 storage_objects                   @relation(fields: [institution_id, latest_storage_object_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                        projects                          @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, id])
+  @@index([institution_id, group_id, status], map: "idx_shared_group_docs_group")
+  @@index([institution_id, project_id, status], map: "idx_shared_group_docs_project")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model storage_objects {
+  id                              String                           @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                  String                           @db.Uuid
+  project_id                      String                           @db.Uuid
+  uploaded_by_user_id             String                           @db.Uuid
+  document_category               document_category_enum
+  storage_bucket                  String                           @db.VarChar(100)
+  storage_object_key              String                           @unique @db.VarChar(512)
+  sanitized_file_name             String                           @db.VarChar(255)
+  validated_extension             String                           @db.VarChar(10)
+  validated_mime_type             String                           @db.VarChar(120)
+  file_size_bytes                 BigInt
+  sha256_checksum                 String                           @db.Char(64)
+  malware_scan_status             malware_scan_status_enum         @default(CLEAN)
+  encryption_key_ref              String                           @db.VarChar(120)
+  upload_idempotency_token        String                           @unique @db.VarChar(120)
+  is_immutable_formal_version     Boolean                          @default(false)
+  created_at                      DateTime                         @default(now()) @db.Timestamptz(6)
+  deadline_extension_requests     deadline_extension_requests[]
+  shared_group_document_revisions shared_group_document_revisions[]
+  shared_group_documents          shared_group_documents[]
+  institutions                    institutions                     @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                        projects                         @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  users                           users                            @relation(fields: [institution_id, uploaded_by_user_id], references: [institution_id, id], onUpdate: NoAction)
+  submission_discussions          submission_discussions[]
+  submission_versions             submission_versions[]
+
+  @@unique([institution_id, id])
+  @@index([institution_id, project_id, document_category, created_at(sort: Desc)], map: "idx_storage_objects_project")
+  @@index([institution_id, uploaded_by_user_id], map: "idx_storage_objects_uploader")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model student_project_registrations {
+  id                           String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id               String                        @db.Uuid
+  programme_id                 String                        @db.Uuid
+  academic_session_id          String                        @db.Uuid
+  student_user_id              String                        @db.Uuid
+  matriculation_number         String                        @db.Citext
+  cohort_status                student_cohort_status_enum    @default(REGISTERED_AWAITING_TOPIC)
+  arrangement_type             project_arrangement_enum      @default(UNASSIGNED)
+  project_id                   String?                       @db.Uuid
+  group_id                     String?                       @db.Uuid
+  registered_by_coordinator_id String                        @db.Uuid
+  created_at                   DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                   DateTime                      @default(now()) @db.Timestamptz(6)
+  consolidated_student_results consolidated_student_results[]
+  project_group_members        project_group_members[]
+  academic_sessions            academic_sessions             @relation(fields: [institution_id, academic_session_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                 institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  project_groups               project_groups?               @relation(fields: [institution_id, group_id], references: [institution_id, id], onUpdate: NoAction)
+  programmes                   programmes                    @relation(fields: [institution_id, programme_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                     projects?                     @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  users                        users                         @relation(fields: [institution_id, student_user_id], references: [institution_id, id], onUpdate: NoAction)
+  supervisor_assessments       supervisor_assessments[]
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, programme_id, academic_session_id, matriculation_number], map: "student_project_registrations_institution_id_programme_id__key1")
+  @@unique([institution_id, programme_id, academic_session_id, student_user_id])
+  @@index([institution_id, programme_id, academic_session_id, cohort_status], map: "idx_student_reg_cohort_status")
+  @@index([institution_id, group_id], map: "idx_student_reg_group_fk", where: raw("(group_id IS NOT NULL)"))
+  @@index([institution_id, project_id], map: "idx_student_reg_project")
+  @@index([institution_id, student_user_id], map: "idx_student_reg_student_lookup")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model submission_discussions {
+  id                             String                     @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                 String                     @db.Uuid
+  project_id                     String                     @db.Uuid
+  submission_version_id          String                     @db.Uuid
+  author_user_id                 String                     @db.Uuid
+  author_role                    role_code_enum
+  entry_type                     discussion_entry_type_enum
+  comment_body                   String
+  annotated_attachment_object_id String?                    @db.Uuid
+  created_at                     DateTime                   @default(now()) @db.Timestamptz(6)
+  storage_objects                storage_objects?           @relation(fields: [institution_id, annotated_attachment_object_id], references: [institution_id, id], onUpdate: NoAction)
+  users                          users                      @relation(fields: [institution_id, author_user_id], references: [institution_id, id], onUpdate: NoAction)
+  institutions                   institutions               @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                       projects                   @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  submission_versions            submission_versions        @relation(fields: [institution_id, submission_version_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@index([institution_id, annotated_attachment_object_id], map: "idx_submission_discussions_attach_fk", where: raw("(annotated_attachment_object_id IS NOT NULL)"))
+  @@index([institution_id, project_id], map: "idx_submission_discussions_proj")
+  @@index([institution_id, submission_version_id, created_at], map: "idx_submission_discussions_version")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model submission_versions {
+  id                            String                   @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                   @db.Uuid
+  project_id                    String                   @db.Uuid
+  milestone_id                  String                   @db.Uuid
+  project_milestone_state_id    String                   @db.Uuid
+  version_number                Int
+  parent_version_id             String?                  @db.Uuid
+  storage_object_id             String                   @unique @db.Uuid
+  submitted_by_user_id          String                   @db.Uuid
+  submission_notes              String?
+  revision_summary_note         String?
+  server_receipt_at             DateTime                 @default(now()) @db.Timestamptz(6)
+  effective_deadline_at_receipt DateTime                 @db.Timestamptz(6)
+  is_late                       Boolean                  @default(false)
+  late_duration_minutes         Int                      @default(0)
+  late_duration_days_ceil       Int                      @default(0)
+  review_decision               review_decision_enum     @default(PENDING)
+  reviewed_by_supervisor_id     String?                  @db.Uuid
+  reviewed_at                   DateTime?                @db.Timestamptz(6)
+  idempotency_upload_token      String                   @unique @db.VarChar(120)
+  project_late_penalties        project_late_penalties[]
+  submission_discussions        submission_discussions[]
+  institutions                  institutions             @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  programme_milestones          programme_milestones     @relation(fields: [institution_id, milestone_id], references: [institution_id, id], onUpdate: NoAction)
+  projects                      projects                 @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  project_milestone_states      project_milestone_states @relation(fields: [institution_id, project_milestone_state_id], references: [institution_id, id], onUpdate: NoAction)
+  storage_objects               storage_objects          @relation(fields: [institution_id, storage_object_id], references: [institution_id, id], onUpdate: NoAction)
+  users                         users                    @relation(fields: [institution_id, submitted_by_user_id], references: [institution_id, id], onUpdate: NoAction)
+  submission_versions           submission_versions?     @relation("submission_versionsTosubmission_versions", fields: [parent_version_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  other_submission_versions     submission_versions[]    @relation("submission_versionsTosubmission_versions")
+
+  @@unique([institution_id, id])
+  @@unique([project_id, milestone_id, version_number])
+  @@index([institution_id, project_id, milestone_id, version_number(sort: Desc)], map: "idx_submission_versions_inst_proj")
+  @@index([institution_id, project_id, review_decision], map: "idx_submission_versions_pending_rev", where: raw("(review_decision = 'PENDING'::review_decision_enum)"))
+  @@index([institution_id, project_milestone_state_id], map: "idx_submission_versions_state_fk")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model subscription_plans {
+  id                          String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  plan_code                   String                        @unique @db.Citext
+  plan_name                   String                        @unique @db.VarChar(120)
+  description                 String?
+  currency                    String                        @default("NGN") @db.Char(3)
+  price_kobo                  BigInt
+  billing_interval            plan_billing_interval_enum
+  billing_duration_days       Int
+  max_user_capacity           Int
+  status                      plan_status_enum              @default(DRAFT)
+  created_by_actor_id         String?                       @db.Uuid
+  created_at                  DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                  DateTime                      @default(now()) @db.Timestamptz(6)
+  institutional_subscriptions institutional_subscriptions[]
+  payment_transactions        payment_transactions[]
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model supervisor_assessments {
+  id                                                                    String                            @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                                                        String                            @db.Uuid
+  project_id                                                            String                            @db.Uuid
+  student_registration_id                                               String                            @unique @db.Uuid
+  student_user_id                                                       String                            @db.Uuid
+  supervisor_user_id                                                    String                            @db.Uuid
+  criterion_scores_jsonb                                                Json                              @default("[]")
+  supervisor_total_score                                                Decimal                           @default(0.0000) @db.Decimal(10, 4)
+  qualitative_feedback                                                  String?
+  status                                                                assessment_submission_status_enum @default(PENDING)
+  revision_number                                                       Int                               @default(1)
+  edit_reason                                                           String?                           @db.VarChar(500)
+  submitted_at                                                          DateTime?                         @db.Timestamptz(6)
+  last_edited_at                                                        DateTime?                         @db.Timestamptz(6)
+  created_at                                                            DateTime                          @default(now()) @db.Timestamptz(6)
+  updated_at                                                            DateTime                          @default(now()) @db.Timestamptz(6)
+  institutions                                                          institutions                      @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                                                              projects                          @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  student_project_registrations                                         student_project_registrations     @relation(fields: [institution_id, student_registration_id], references: [institution_id, id], onUpdate: NoAction)
+  users_supervisor_assessments_institution_id_student_user_idTousers    users                             @relation("supervisor_assessments_institution_id_student_user_idTousers", fields: [institution_id, student_user_id], references: [institution_id, id], onUpdate: NoAction)
+  users_supervisor_assessments_institution_id_supervisor_user_idTousers users                             @relation("supervisor_assessments_institution_id_supervisor_user_idTousers", fields: [institution_id, supervisor_user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([project_id, student_user_id])
+  @@index([institution_id, project_id, status], map: "idx_supervisor_assessments_project")
+  @@index([institution_id, supervisor_user_id, status], map: "idx_supervisor_assessments_supervisor")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model supervisor_records {
+  id                          String                        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id              String                        @db.Uuid
+  user_id                     String                        @db.Uuid
+  primary_department_id       String                        @db.Uuid
+  academic_title              String                        @db.VarChar(30)
+  specialization_tags         String[]                      @default([])
+  eligibility_status          supervisor_eligibility_enum   @default(AVAILABLE)
+  created_at                  DateTime                      @default(now()) @db.Timestamptz(6)
+  updated_at                  DateTime                      @default(now()) @db.Timestamptz(6)
+  project_supervision_history project_supervision_history[]
+  institutions                institutions                  @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  departments                 departments                   @relation(fields: [institution_id, primary_department_id], references: [institution_id, id], onUpdate: NoAction)
+  users                       users                         @relation(fields: [institution_id, user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, id])
+  @@unique([institution_id, user_id])
+  @@index([institution_id, primary_department_id, eligibility_status], map: "idx_supervisor_records_dept_elig")
+  @@index([specialization_tags], map: "idx_supervisor_tags_gin", type: Gin)
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model topic_proposals {
+  id                            String                     @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                String                     @db.Uuid
+  programme_id                  String                     @db.Uuid
+  academic_session_id           String                     @db.Uuid
+  project_id                    String                     @db.Uuid
+  parent_proposal_id            String?                    @db.Uuid
+  iteration_number              Int                        @default(1)
+  proposed_title                String                     @db.VarChar(300)
+  problem_statement             String
+  objectives                    String
+  methodology                   String
+  keywords                      String[]                   @default([])
+  submitted_by_user_id          String                     @db.Uuid
+  submitted_at                  DateTime                   @default(now()) @db.Timestamptz(6)
+  status                        topic_proposal_status_enum @default(SUBMITTED_AWAITING_SUPERVISOR)
+  reviewed_by_supervisor_id     String?                    @db.Uuid
+  reviewed_at                   DateTime?                  @db.Timestamptz(6)
+  supervisor_feedback           String?
+  alternative_topic_title       String?                    @db.VarChar(300)
+  alternative_topic_description String?
+  alternative_topic_rationale   String?
+  institutions                  institutions               @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  projects                      projects                   @relation(fields: [institution_id, project_id], references: [institution_id, id], onUpdate: NoAction)
+  users                         users                      @relation(fields: [institution_id, submitted_by_user_id], references: [institution_id, id], onUpdate: NoAction)
+  topic_proposals               topic_proposals?           @relation("topic_proposalsTotopic_proposals", fields: [parent_proposal_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  other_topic_proposals         topic_proposals[]          @relation("topic_proposalsTotopic_proposals")
+
+  @@index([keywords], map: "idx_topic_keywords_gin", type: Gin)
+  @@index([parent_proposal_id], map: "idx_topic_proposals_parent_fk", where: raw("(parent_proposal_id IS NOT NULL)"))
+  @@index([institution_id, project_id, iteration_number(sort: Desc)], map: "idx_topic_proposals_project")
+  @@index([institution_id, programme_id, academic_session_id, status], map: "idx_topic_proposals_scope_status")
+  @@index([institution_id, reviewed_by_supervisor_id, status], map: "idx_topic_proposals_sup_review")
+}
+
+model transactional_outbox_events {
+  id             String        @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id String?       @db.Uuid
+  event_type     String        @db.VarChar(100)
+  aggregate_type String        @db.VarChar(80)
+  aggregate_id   String        @db.Uuid
+  payload_jsonb  Json
+  processed      Boolean       @default(false)
+  created_at     DateTime      @default(now()) @db.Timestamptz(6)
+  processed_at   DateTime?     @db.Timestamptz(6)
+  institutions   institutions? @relation(fields: [institution_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([created_at], map: "idx_outbox_unprocessed", where: raw("(processed = false)"))
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model user_role_assignments {
+  id                  String                      @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id      String                      @db.Uuid
+  user_id             String                      @db.Uuid
+  role_code           role_code_enum
+  status              academic_entity_status_enum @default(ACTIVE)
+  assigned_by_user_id String                      @db.Uuid
+  assigned_at         DateTime                    @default(now()) @db.Timestamptz(6)
+  revoked_at          DateTime?                   @db.Timestamptz(6)
+  institutions        institutions                @relation(fields: [institution_id], references: [id], onUpdate: NoAction)
+  users               users                       @relation(fields: [institution_id, user_id], references: [institution_id, id], onUpdate: NoAction)
+
+  @@unique([institution_id, user_id, role_code])
+  @@index([institution_id, role_code], map: "idx_user_roles_inst_role_active", where: raw("(status = 'ACTIVE'::academic_entity_status_enum)"))
+}
+
+model user_sessions {
+  id                                String         @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  user_id                           String         @db.Uuid
+  institution_id                    String?        @db.Uuid
+  active_role                       role_code_enum
+  active_coordinator_appointment_id String?        @db.Uuid
+  mfa_verified                      Boolean        @default(false)
+  ip_address                        String?        @db.Inet
+  user_agent                        String?
+  inactivity_timeout_minutes        Int            @default(30)
+  last_activity_at                  DateTime       @default(now()) @db.Timestamptz(6)
+  expires_at                        DateTime       @db.Timestamptz(6)
+  is_revoked                        Boolean        @default(false)
+  revoked_reason                    String?        @db.VarChar(200)
+  created_at                        DateTime       @default(now()) @db.Timestamptz(6)
+  institutions                      institutions?  @relation(fields: [institution_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users                             users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id, is_revoked, expires_at], map: "idx_user_sessions_lookup")
+  @@index([institution_id, is_revoked], map: "idx_user_sessions_tenant")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model users {
+  id                                                                                     String                          @id @default(dbgenerated("uuid_generate_v7()")) @db.Uuid
+  institution_id                                                                         String?                         @db.Uuid
+  is_platform_admin                                                                      Boolean                         @default(false)
+  full_name                                                                              String                          @db.VarChar(120)
+  email                                                                                  String                          @unique(map: "idx_users_platform_admin_email", where: raw("(is_platform_admin = true)")) @db.Citext
+  institutional_id_number                                                                String?                         @db.Citext
+  primary_department_id                                                                  String?                         @db.Uuid
+  account_status                                                                         user_account_status_enum        @default(INVITED)
+  is_under_18                                                                            Boolean                         @default(false)
+  guardian_name                                                                          String?                         @db.VarChar(120)
+  guardian_email                                                                         String?                         @db.Citext
+  guardian_consent_status                                                                guardian_consent_status_enum    @default(NOT_REQUIRED_ADULT)
+  password_hash                                                                          String?
+  mfa_required                                                                           Boolean                         @default(false)
+  mfa_enrolled                                                                           Boolean                         @default(false)
+  mfa_secret_encrypted                                                                   String?
+  mfa_recovery_codes_hash                                                                Json?
+  failed_login_attempts                                                                  Int                             @default(0)
+  locked_until                                                                           DateTime?                       @db.Timestamptz(6)
+  invitation_token_hash                                                                  String?                         @db.Char(64)
+  invitation_expires_at                                                                  DateTime?                       @db.Timestamptz(6)
+  password_reset_token_hash                                                              String?                         @db.Char(64)
+  password_reset_expires_at                                                              DateTime?                       @db.Timestamptz(6)
+  last_login_at                                                                          DateTime?                       @db.Timestamptz(6)
+  created_at                                                                             DateTime                        @default(now()) @db.Timestamptz(6)
+  updated_at                                                                             DateTime                        @default(now()) @db.Timestamptz(6)
+  consolidated_student_results                                                           consolidated_student_results[]
+  coordinator_appointments                                                               coordinator_appointments[]
+  examiner_appointments                                                                  examiner_appointments[]
+  examiner_assessments                                                                   examiner_assessments[]
+  in_app_notifications                                                                   in_app_notifications[]
+  notification_dispatch_jobs                                                             notification_dispatch_jobs[]
+  project_group_members                                                                  project_group_members[]
+  project_supervision_history                                                            project_supervision_history[]
+  projects                                                                               projects[]
+  storage_objects                                                                        storage_objects[]
+  student_project_registrations                                                          student_project_registrations[]
+  submission_discussions                                                                 submission_discussions[]
+  submission_versions                                                                    submission_versions[]
+  supervisor_assessments_supervisor_assessments_institution_id_student_user_idTousers    supervisor_assessments[]        @relation("supervisor_assessments_institution_id_student_user_idTousers")
+  supervisor_assessments_supervisor_assessments_institution_id_supervisor_user_idTousers supervisor_assessments[]        @relation("supervisor_assessments_institution_id_supervisor_user_idTousers")
+  supervisor_records                                                                     supervisor_records?
+  topic_proposals                                                                        topic_proposals[]
+  user_role_assignments                                                                  user_role_assignments[]
+  user_sessions                                                                          user_sessions[]
+  institutions                                                                           institutions?                   @relation(fields: [institution_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([institution_id, email], map: "idx_users_tenant_email", where: raw("(institution_id IS NOT NULL)"))
+  @@unique([institution_id, institutional_id_number], map: "idx_users_tenant_inst_id", where: raw("(institution_id IS NOT NULL)"))
+  @@unique([institution_id, id])
+  @@index([institution_id, primary_department_id, account_status], map: "idx_users_inst_dept_status", where: raw("(institution_id IS NOT NULL)"))
+  @@index([invitation_token_hash], map: "idx_users_invitation_token", where: raw("(invitation_token_hash IS NOT NULL)"))
+  @@index([password_reset_token_hash], map: "idx_users_reset_token", where: raw("(password_reset_token_hash IS NOT NULL)"))
+}
+
+enum academic_entity_status_enum {
+  ACTIVE
+  ARCHIVED
+}
+
+enum academic_outcome_enum {
+  PASS
+  FAIL
+}
+
+enum academic_session_status_enum {
+  UPCOMING
+  ACTIVE
+  CLOSED
+}
+
+enum assessment_submission_status_enum {
+  PENDING
+  DRAFT
+  SUBMITTED
+  PUBLISHED_LOCKED
+}
+
+enum consolidation_method_enum {
+  ARITHMETIC_MEAN
+  WEIGHTED_PANEL
+  COORDINATOR_RESOLVED
+}
+
+enum defence_schedule_status_enum {
+  SCHEDULED
+  RESCHEDULED
+  COMPLETED
+}
+
+enum discussion_entry_type_enum {
+  FORMAL_REVIEW_FEEDBACK
+  DISCUSSION_COMMENT
+}
+
+enum dispatch_status_enum {
+  PENDING
+  PROCESSING
+  DELIVERED
+  RETRY_SCHEDULED
+  FAILED_DEAD_LETTER
+}
+
+enum document_category_enum {
+  MILESTONE_SUBMISSION
+  FINAL_PROJECT_SUBMISSION
+  SHARED_GROUP_WORKING_DOC
+  SUPERVISOR_FEEDBACK_ATTACHMENT
+  EXTENSION_EVIDENCE
+}
+
+enum examiner_appointment_status_enum {
+  ACTIVE
+  REMOVED
+}
+
+enum extension_request_status_enum {
+  PENDING_SUPERVISOR_RECOMMENDATION
+  RECOMMENDED_PENDING_COORDINATOR
+  DECLINED_BY_SUPERVISOR
+  APPROVED
+  REJECTED_BY_COORDINATOR
+}
+
+enum guardian_consent_status_enum {
+  NOT_REQUIRED_ADULT
+  NOT_REQUIRED_STATUTORY_EDUCATIONAL_BASIS
+  PENDING_VERIFICATION
+  VERIFIED
+}
+
+enum late_penalty_mode_enum {
+  DISABLED_ADVISORY_ONLY
+  FLAT_MARKS_PER_DAY
+  PERCENTAGE_PER_DAY
+  FIXED_FLAT_DEDUCTION
+}
+
+enum malware_scan_status_enum {
+  PENDING_SCAN
+  CLEAN
+  REJECTED_INFECTED
+}
+
+enum milestone_type_enum {
+  INTERIM
+  FINAL_SUBMISSION
+}
+
+enum notification_channel_enum {
+  IN_APP
+  EMAIL
+}
+
+enum payment_tx_status_enum {
+  INITIATED
+  PENDING_VERIFICATION
+  SUCCEEDED
+  FAILED
+  ABANDONED
+  DISCREPANCY_REQUIRES_RECONCILIATION
+}
+
+enum plan_billing_interval_enum {
+  ANNUAL
+  SEMESTER_SESSION
+  MONTHLY
+}
+
+enum plan_status_enum {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum project_arrangement_enum {
+  UNASSIGNED
+  INDIVIDUAL
+  GROUP
+}
+
+enum project_lifecycle_status_enum {
+  TOPIC_PROPOSAL
+  ACTIVE_SUPERVISION
+  FINAL_SUBMITTED
+  UNDER_EXAMINATION
+  RESULTS_APPROVED
+  RESULTS_PUBLISHED
+  COMPLETED
+}
+
+enum project_milestone_state_enum {
+  LOCKED
+  IN_PROGRESS_NOT_SUBMITTED
+  SUBMITTED_AWAITING_REVIEW
+  REVISIONS_REQUESTED
+  REJECTED
+  APPROVED
+}
+
+enum project_type_enum {
+  INDIVIDUAL
+  GROUP
+}
+
+enum result_approval_status_enum {
+  INCOMPLETE_ASSESSMENTS
+  CONSOLIDATED_PENDING_APPROVAL
+  APPROVED_READY_FOR_PUBLICATION
+  PENDING_COORDINATOR_REAPPROVAL
+  PUBLISHED
+}
+
+enum review_decision_enum {
+  PENDING
+  APPROVED
+  REVISIONS_REQUESTED
+  REJECTED
+}
+
+enum role_code_enum {
+  PLATFORM_ADMIN
+  INSTITUTIONAL_ADMIN
+  PROJECT_COORDINATOR
+  PROJECT_SUPERVISOR
+  PROJECT_EXAMINER
+  STUDENT
+}
+
+enum rounding_mode_enum {
+  ROUND_HALF_UP_2DP
+  ROUND_HALF_UP_INTEGER
+  NONE_EXACT
+}
+
+enum student_cohort_status_enum {
+  REGISTERED_AWAITING_TOPIC
+  TOPIC_PROPOSED
+  ALLOCATED
+  COMPLETED
+  FAILED_INCOMPLETE
+}
+
+enum subscription_status_enum {
+  PENDING_PAYMENT
+  ACTIVE
+  GRACE_PERIOD
+  EXPIRED
+  CANCELLED
+}
+
+enum supervision_assignment_status_enum {
+  ACTIVE
+  REASSIGNED_HISTORICAL
+}
+
+enum supervisor_eligibility_enum {
+  AVAILABLE
+  UNAVAILABLE_ON_LEAVE
+  INACTIVE
+}
+
+enum tenant_status_enum {
+  PENDING_ACTIVATION
+  ACTIVE
+  SUSPENDED
+  PENDING_TERMINATION
+  TERMINATED
+}
+
+enum topic_proposal_status_enum {
+  SUBMITTED_AWAITING_SUPERVISOR
+  UNDER_SUPERVISOR_REVIEW
+  APPROVED
+  REJECTED
+  ALTERNATIVE_SUGGESTED
+  SUPERSEDED
+}
+
+enum user_account_status_enum {
+  INVITED
+  ACTIVE
+  DEACTIVATED
+}
+
+enum webhook_processing_status_enum {
+  RECEIVED
+  PROCESSED
+  DUPLICATE_IGNORED
+  REJECTED_INVALID_SIGNATURE
+  FAILED
+}
