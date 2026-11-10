@@ -34,14 +34,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Builds the workspace dependency first: @clario/shared-contracts publishes
+      # its types from dist/, which is gitignored and therefore missing on a fresh
+      # checkout until it is built.
+      - name: Build shared package
+        run: pnpm --filter @clario/shared-contracts run build
+
       - name: Check TypeScript types
         run: pnpm -r --if-present run typecheck
 
       - name: Run ESLint
         run: pnpm --filter client run lint
-
-      - name: Build shared package
-        run: pnpm --filter @clario/shared-contracts run build
 
       - name: Build backend
         run: pnpm --filter backend run build

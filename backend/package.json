@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm --filter @clario/shared-contracts run build && tsc --noEmit",
     "db:generate": "prisma7 generate --config prisma7.config.ts",
     "db:validate": "prisma7 validate --config prisma7.config.ts",
     "db:format": "prisma7 format --config prisma7.config.ts",
