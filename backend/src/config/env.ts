@@ -1,5 +1,21 @@
 
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { config as loadEnv } from "dotenv";
 import { z } from "zod";
+
+const backendConfigDir = path.dirname(
+  fileURLToPath(import.meta.url)
+);
+const repoRoot = path.resolve(
+  backendConfigDir,
+  "../../.."
+);
+
+loadEnv({
+  path: path.join(repoRoot, ".env"),
+});
 
 const postgresUrlSchema = z
   .string()

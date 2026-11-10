@@ -1,33 +1,9 @@
 -- =============================================================================
--- CLARIO MVP — COMPLETE PHYSICAL DATABASE SCHEMA (POSTGRESQL 16 DDL)
--- Target Release: Clario MVP (P0 Scope Only - 75 Features, FR-001 to FR-290)
--- Jurisdiction & Currency: Nigeria (NGN - stored in integer kobo)
--- Default Timezone Authority: Africa/Lagos (WAT)
--- OPTIMIZED FOR SCALE & HIGH CONCURRENCY (UUIDv7, RLS InitPlan, Tenant-Scoped Hash Chain)
+-- CLARIO MVP — CORE SCHEMA: UTILITY FUNCTIONS, ENUMERATED TYPES, TABLES & CONSTRAINTS
+-- Reviewed SQL migration. Statements are taken verbatim from
+-- docs/clario_mvp_schema.sql (authoritative physical schema) unless a comment
+-- states otherwise. Do not weaken constraints defined there.
 -- =============================================================================
-
-BEGIN;
-
--- -----------------------------------------------------------------------------
--- 0. EXTENSIONS, APPLICATION ROLES & UTILITY FUNCTIONS
--- -----------------------------------------------------------------------------
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-CREATE EXTENSION IF NOT EXISTS "citext";
-CREATE EXTENSION IF NOT EXISTS "btree_gist";
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'clario_app_role') THEN
-        CREATE ROLE clario_app_role NOINHERIT;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'clario_audit_reader_role') THEN
-        CREATE ROLE clario_audit_reader_role NOINHERIT;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'clario_worker_role') THEN
-        CREATE ROLE clario_worker_role NOINHERIT BYPASSRLS;
-    END IF;
-END
-$$;
 
 -- UUIDv7 Generator Function for Sequential, Non-Fragmenting Primary Keys
 CREATE OR REPLACE FUNCTION uuid_generate_v7() RETURNS UUID AS $$
@@ -59,7 +35,6 @@ $$ LANGUAGE SQL STABLE;
 CREATE OR REPLACE FUNCTION is_platform_admin_context() RETURNS BOOLEAN AS $$
     SELECT COALESCE(current_setting('app.is_platform_admin', TRUE), 'false') = 'true';
 $$ LANGUAGE SQL STABLE;
-
 -- -----------------------------------------------------------------------------
 -- 1. ENUMERATED TYPES (DOMAIN INVARIANTS)
 -- -----------------------------------------------------------------------------
@@ -324,8 +299,6 @@ CREATE TABLE institutions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX idx_institutions_name_ci ON institutions (LOWER(name));
-CREATE INDEX idx_institutions_status ON institutions (account_status);
 
 -- F-02: Subscription Plan Management (NGN minor units / kobo)
 CREATE TABLE subscription_plans (
@@ -376,8 +349,6 @@ CREATE TABLE institutional_subscriptions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX idx_inst_subscriptions_status_end ON institutional_subscriptions (subscription_status, current_period_end, grace_period_end);
-CREATE INDEX idx_inst_subscriptions_plan_fk ON institutional_subscriptions (plan_id);
 
 -- F-67: Institutional Subscription Payment Processing (NGN kobo + Idempotency)
 CREATE TABLE payment_transactions (
@@ -397,9 +368,6 @@ CREATE TABLE payment_transactions (
     verified_at TIMESTAMPTZ,
     failure_reason TEXT
 );
-CREATE INDEX idx_payment_tx_institution ON payment_transactions (institution_id, initiated_at DESC);
-CREATE INDEX idx_payment_tx_inst_status ON payment_transactions (institution_id, status, initiated_at DESC);
-CREATE INDEX idx_payment_tx_sub_fk ON payment_transactions (subscription_id);
 
 -- F-68: Payment Event Reception (Idempotent Webhook Log)
 CREATE TABLE payment_webhook_events (
@@ -415,9 +383,6 @@ CREATE TABLE payment_webhook_events (
     processed_at TIMESTAMPTZ,
     error_message TEXT
 );
-CREATE INDEX idx_webhook_events_tx_ref_fk ON payment_webhook_events (idempotency_reference);
-CREATE INDEX idx_webhook_events_status ON payment_webhook_events (processing_status, received_at)
-    WHERE processing_status IN ('RECEIVED', 'FAILED');
 
 -- -----------------------------------------------------------------------------
 -- 3. MODULE B & K: ACADEMIC HIERARCHY, USERS, ROLES, SESSIONS & MFA
@@ -437,7 +402,6 @@ CREATE TABLE faculties (
     UNIQUE (institution_id, code),
     UNIQUE (institution_id, id)
 );
-CREATE UNIQUE INDEX idx_faculties_inst_name_ci ON faculties (institution_id, LOWER(name));
 
 -- F-10: Department Management
 CREATE TABLE departments (
@@ -455,8 +419,6 @@ CREATE TABLE departments (
     UNIQUE (institution_id, id),
     FOREIGN KEY (institution_id, faculty_id) REFERENCES faculties(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_departments_inst_name_ci ON departments (institution_id, LOWER(name));
-CREATE INDEX idx_departments_inst_faculty ON departments (institution_id, faculty_id, status);
 
 -- F-11: Programme Management
 CREATE TABLE programmes (
@@ -477,9 +439,6 @@ CREATE TABLE programmes (
     FOREIGN KEY (institution_id, faculty_id) REFERENCES faculties(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, department_id) REFERENCES departments(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_programmes_inst_name_ci ON programmes (institution_id, LOWER(name));
-CREATE INDEX idx_programmes_inst_dept ON programmes (institution_id, department_id, status);
-CREATE INDEX idx_programmes_inst_faculty ON programmes (institution_id, faculty_id, status);
 
 -- F-12: Academic Session Management
 CREATE TABLE academic_sessions (
@@ -496,7 +455,6 @@ CREATE TABLE academic_sessions (
     UNIQUE (institution_id, session_label),
     UNIQUE (institution_id, id)
 );
-CREATE INDEX idx_academic_sessions_inst_status ON academic_sessions (institution_id, status, start_date DESC);
 
 -- F-05, F-13, F-64: Users (Platform Admins & Institutional Users)
 CREATE TABLE users (
@@ -532,12 +490,6 @@ CREATE TABLE users (
     ),
     UNIQUE (institution_id, id)
 );
-CREATE UNIQUE INDEX idx_users_platform_admin_email ON users (email) WHERE is_platform_admin = TRUE;
-CREATE UNIQUE INDEX idx_users_tenant_email ON users (institution_id, email) WHERE institution_id IS NOT NULL;
-CREATE UNIQUE INDEX idx_users_tenant_inst_id ON users (institution_id, institutional_id_number) WHERE institution_id IS NOT NULL;
-CREATE INDEX idx_users_invitation_token ON users (invitation_token_hash) WHERE invitation_token_hash IS NOT NULL;
-CREATE INDEX idx_users_reset_token ON users (password_reset_token_hash) WHERE password_reset_token_hash IS NOT NULL;
-CREATE INDEX idx_users_inst_dept_status ON users (institution_id, primary_department_id, account_status) WHERE institution_id IS NOT NULL;
 
 -- F-14: Institutional Role Assignments
 CREATE TABLE user_role_assignments (
@@ -552,7 +504,6 @@ CREATE TABLE user_role_assignments (
     UNIQUE (institution_id, user_id, role_code),
     FOREIGN KEY (institution_id, user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_user_roles_inst_role_active ON user_role_assignments (institution_id, role_code) WHERE status = 'ACTIVE';
 
 -- F-15: Project Coordinator Appointments (BR-03: Strictly 1 Programme + 1 Session per Appointment)
 CREATE TABLE coordinator_appointments (
@@ -571,8 +522,6 @@ CREATE TABLE coordinator_appointments (
     FOREIGN KEY (institution_id, programme_id) REFERENCES programmes(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, academic_session_id) REFERENCES academic_sessions(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_coord_active_unique ON coordinator_appointments (institution_id, user_id, programme_id, academic_session_id) WHERE status = 'ACTIVE';
-CREATE INDEX idx_coord_appt_prog_session ON coordinator_appointments (institution_id, programme_id, academic_session_id, status);
 
 -- F-16: Supervisor Eligibility Records
 CREATE TABLE supervisor_records (
@@ -590,8 +539,6 @@ CREATE TABLE supervisor_records (
     FOREIGN KEY (institution_id, user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, primary_department_id) REFERENCES departments(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_supervisor_records_dept_elig ON supervisor_records (institution_id, primary_department_id, eligibility_status);
-CREATE INDEX idx_supervisor_tags_gin ON supervisor_records USING GIN (specialization_tags);
 
 -- F-65: Stateful Server Sessions (Supports Immediate Revocation & Role-Based Inactivity Timeouts)
 CREATE TABLE user_sessions (
@@ -610,8 +557,6 @@ CREATE TABLE user_sessions (
     revoked_reason VARCHAR(200),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 ) WITH (fillfactor = 80);
-CREATE INDEX idx_user_sessions_lookup ON user_sessions (user_id, is_revoked, expires_at);
-CREATE INDEX idx_user_sessions_tenant ON user_sessions (institution_id, is_revoked);
 
 -- -----------------------------------------------------------------------------
 -- 4. MODULE C & D: PROJECTS, GROUPS, COHORT REGISTRATION, TOPICS & SUPERVISION
@@ -640,9 +585,6 @@ CREATE TABLE projects (
     FOREIGN KEY (institution_id, academic_session_id) REFERENCES academic_sessions(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, current_supervisor_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 ) WITH (fillfactor = 85);
-CREATE INDEX idx_projects_scope ON projects (institution_id, programme_id, academic_session_id, lifecycle_status);
-CREATE INDEX idx_projects_supervisor ON projects (institution_id, current_supervisor_user_id);
-CREATE INDEX idx_projects_approval_scope ON projects (institution_id, programme_id, academic_session_id, result_approval_status);
 
 -- F-22: Project Groups
 CREATE TABLE project_groups (
@@ -686,10 +628,6 @@ CREATE TABLE student_project_registrations (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, group_id) REFERENCES project_groups(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_student_reg_project ON student_project_registrations (institution_id, project_id);
-CREATE INDEX idx_student_reg_student_lookup ON student_project_registrations (institution_id, student_user_id);
-CREATE INDEX idx_student_reg_group_fk ON student_project_registrations (institution_id, group_id) WHERE group_id IS NOT NULL;
-CREATE INDEX idx_student_reg_cohort_status ON student_project_registrations (institution_id, programme_id, academic_session_id, cohort_status);
 
 -- F-22 & F-23: Project Group Members & Designated Submission Authority (BR-08)
 CREATE TABLE project_group_members (
@@ -710,8 +648,6 @@ CREATE TABLE project_group_members (
     FOREIGN KEY (institution_id, student_registration_id) REFERENCES student_project_registrations(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, student_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_group_members_submitter ON project_group_members (institution_id, project_id, student_user_id, is_designated_submitter) WHERE member_status = 'ACTIVE';
-CREATE INDEX idx_group_members_student_lookup ON project_group_members (institution_id, student_user_id, member_status);
 
 -- F-20: Project Topic Proposals & Review Management (BR-04, BR-05)
 CREATE TABLE topic_proposals (
@@ -745,11 +681,6 @@ CREATE TABLE topic_proposals (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, submitted_by_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_topic_proposals_project ON topic_proposals (institution_id, project_id, iteration_number DESC);
-CREATE INDEX idx_topic_proposals_scope_status ON topic_proposals (institution_id, programme_id, academic_session_id, status);
-CREATE INDEX idx_topic_proposals_sup_review ON topic_proposals (institution_id, reviewed_by_supervisor_id, status);
-CREATE INDEX idx_topic_proposals_parent_fk ON topic_proposals (parent_proposal_id) WHERE parent_proposal_id IS NOT NULL;
-CREATE INDEX idx_topic_keywords_gin ON topic_proposals USING GIN (keywords);
 
 -- F-24 & F-27: Project Supervision Assignment & Reassignment History (Enforces BR-16 Examiner Independence)
 CREATE TABLE project_supervision_history (
@@ -770,10 +701,6 @@ CREATE TABLE project_supervision_history (
     FOREIGN KEY (institution_id, supervisor_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, supervisor_record_id) REFERENCES supervisor_records(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_one_active_supervisor_per_project ON project_supervision_history (institution_id, project_id) WHERE assignment_status = 'ACTIVE';
-CREATE INDEX idx_supervision_history_lookup ON project_supervision_history (institution_id, project_id, supervisor_user_id);
-CREATE INDEX idx_supervision_history_sup_user ON project_supervision_history (institution_id, supervisor_user_id, assignment_status);
-CREATE INDEX idx_supervision_history_rec_fk ON project_supervision_history (institution_id, supervisor_record_id);
 
 -- -----------------------------------------------------------------------------
 -- 5. MODULE N: SECURE DOCUMENT STORAGE & IMMUTABLE VERSION PRESERVATION
@@ -802,8 +729,6 @@ CREATE TABLE storage_objects (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, uploaded_by_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_storage_objects_project ON storage_objects (institution_id, project_id, document_category, created_at DESC);
-CREATE INDEX idx_storage_objects_uploader ON storage_objects (institution_id, uploaded_by_user_id);
 
 -- -----------------------------------------------------------------------------
 -- 6. MODULE E, F & G: MILESTONES, SUBMISSIONS, VERSIONS, GROUP DOCS & DEADLINES
@@ -830,7 +755,6 @@ CREATE TABLE programme_milestones (
     FOREIGN KEY (institution_id, programme_id) REFERENCES programmes(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, academic_session_id) REFERENCES academic_sessions(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_one_final_milestone_per_prog ON programme_milestones (institution_id, programme_id, academic_session_id) WHERE milestone_type = 'FINAL_SUBMISSION';
 
 -- F-30, F-31, F-41: Per-Project Milestone State & Effective Deadline Tracking
 CREATE TABLE project_milestone_states (
@@ -853,9 +777,6 @@ CREATE TABLE project_milestone_states (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, milestone_id) REFERENCES programme_milestones(institution_id, id) ON DELETE RESTRICT
 ) WITH (fillfactor = 80);
-CREATE INDEX idx_proj_milestone_overdue_scan ON project_milestone_states (effective_deadline_utc, progress_state, is_overdue);
-CREATE INDEX idx_proj_milestone_inst_proj_seq ON project_milestone_states (institution_id, project_id, sequence_number);
-CREATE INDEX idx_proj_milestone_milestone_fk ON project_milestone_states (institution_id, milestone_id);
 
 -- F-32, F-33, F-35, F-43, F-78: Formal Milestone & Final Submission Versions (Append-Only Version Preservation)
 CREATE TABLE submission_versions (
@@ -890,10 +811,6 @@ CREATE TABLE submission_versions (
     FOREIGN KEY (institution_id, storage_object_id) REFERENCES storage_objects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, submitted_by_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_submission_versions_inst_proj ON submission_versions (institution_id, project_id, milestone_id, version_number DESC);
-CREATE INDEX idx_submission_versions_state_fk ON submission_versions (institution_id, project_milestone_state_id);
-CREATE INDEX idx_submission_versions_pending_rev ON submission_versions (institution_id, project_id, review_decision)
-    WHERE review_decision = 'PENDING';
 
 -- F-34: Submission Feedback & Contextual Discussions (BR-27: Strictly Bound to Submission Version ID)
 CREATE TABLE submission_discussions (
@@ -912,10 +829,6 @@ CREATE TABLE submission_discussions (
     FOREIGN KEY (institution_id, author_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, annotated_attachment_object_id) REFERENCES storage_objects(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_submission_discussions_version ON submission_discussions (institution_id, submission_version_id, created_at ASC);
-CREATE INDEX idx_submission_discussions_proj ON submission_discussions (institution_id, project_id);
-CREATE INDEX idx_submission_discussions_attach_fk ON submission_discussions (institution_id, annotated_attachment_object_id)
-    WHERE annotated_attachment_object_id IS NOT NULL;
 
 -- F-37: Shared Group Working Documents & Revisions
 CREATE TABLE shared_group_documents (
@@ -936,8 +849,6 @@ CREATE TABLE shared_group_documents (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, latest_storage_object_id) REFERENCES storage_objects(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_shared_group_docs_group ON shared_group_documents (institution_id, group_id, status);
-CREATE INDEX idx_shared_group_docs_project ON shared_group_documents (institution_id, project_id, status);
 
 CREATE TABLE shared_group_document_revisions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
@@ -952,7 +863,6 @@ CREATE TABLE shared_group_document_revisions (
     FOREIGN KEY (institution_id, shared_document_id) REFERENCES shared_group_documents(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, storage_object_id) REFERENCES storage_objects(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_shared_group_doc_revs_lookup ON shared_group_document_revisions (institution_id, shared_document_id, revision_number DESC);
 
 -- F-42: Two-Tier Deadline Extension Requests (BR-15: Student -> Supervisor Recommends -> Coordinator Approves)
 CREATE TABLE deadline_extension_requests (
@@ -984,11 +894,6 @@ CREATE TABLE deadline_extension_requests (
     FOREIGN KEY (institution_id, milestone_id) REFERENCES programme_milestones(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, supporting_evidence_object_id) REFERENCES storage_objects(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_ext_requests_project ON deadline_extension_requests (institution_id, project_id, milestone_id);
-CREATE INDEX idx_ext_requests_sup_pending ON deadline_extension_requests (institution_id, supervisor_user_id, status)
-    WHERE status = 'PENDING_SUPERVISOR_RECOMMENDATION';
-CREATE INDEX idx_ext_requests_coord_pending ON deadline_extension_requests (institution_id, programme_id, academic_session_id, status)
-    WHERE status = 'RECOMMENDED_PENDING_COORDINATOR';
 
 -- F-44: Programme Late Submission Penalty Policy & Project Penalty Records (BR-14, OD-05)
 CREATE TABLE late_penalty_rules (
@@ -1028,7 +933,6 @@ CREATE TABLE project_late_penalties (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, submission_version_id) REFERENCES submission_versions(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_proj_late_penalties_project ON project_late_penalties (institution_id, project_id);
 
 -- -----------------------------------------------------------------------------
 -- 7. MODULE H, I & J: EXAMINATION, GRADING, CONSOLIDATION & ATOMIC PUBLICATION
@@ -1100,9 +1004,6 @@ CREATE TABLE examiner_appointments (
     FOREIGN KEY (institution_id, panel_id) REFERENCES examination_panels(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, examiner_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX idx_active_examiner_per_project ON examiner_appointments (institution_id, project_id, examiner_user_id) WHERE status = 'ACTIVE';
-CREATE INDEX idx_examiner_appt_user_lookup ON examiner_appointments (institution_id, examiner_user_id, status);
-CREATE INDEX idx_examiner_appt_panel_fk ON examiner_appointments (institution_id, panel_id) WHERE panel_id IS NOT NULL;
 
 -- F-49: Oral Project Defence Scheduling
 CREATE TABLE defence_schedules (
@@ -1125,8 +1026,6 @@ CREATE TABLE defence_schedules (
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, panel_id) REFERENCES examination_panels(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_defence_schedules_scope_date ON defence_schedules (institution_id, programme_id, academic_session_id, defence_date, start_time_utc);
-CREATE INDEX idx_defence_schedules_panel_fk ON defence_schedules (institution_id, panel_id) WHERE panel_id IS NOT NULL;
 
 -- F-52, F-53, F-54, F-55: Examiner Project Assessments (Shared Across Group per BR-NEW-02)
 CREATE TABLE examiner_assessments (
@@ -1153,8 +1052,6 @@ CREATE TABLE examiner_assessments (
     FOREIGN KEY (institution_id, examiner_appointment_id) REFERENCES examiner_appointments(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, examiner_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 ) WITH (fillfactor = 85);
-CREATE INDEX idx_examiner_assessments_project ON examiner_assessments (institution_id, project_id, status);
-CREATE INDEX idx_examiner_assessments_examiner ON examiner_assessments (institution_id, examiner_user_id, status);
 
 -- F-39 & F-56: Supervisor Performance Assessments (Evaluated Individually per Student Member per BR-NEW-02)
 CREATE TABLE supervisor_assessments (
@@ -1180,8 +1077,6 @@ CREATE TABLE supervisor_assessments (
     FOREIGN KEY (institution_id, student_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, supervisor_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 ) WITH (fillfactor = 85);
-CREATE INDEX idx_supervisor_assessments_project ON supervisor_assessments (institution_id, project_id, status);
-CREATE INDEX idx_supervisor_assessments_supervisor ON supervisor_assessments (institution_id, supervisor_user_id, status);
 
 -- F-58, F-59, F-60, F-61, F-62: Consolidated Student Final Results & Completion Checklist (Private per Student)
 CREATE TABLE consolidated_student_results (
@@ -1219,9 +1114,6 @@ CREATE TABLE consolidated_student_results (
     FOREIGN KEY (institution_id, student_registration_id) REFERENCES student_project_registrations(institution_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (institution_id, student_user_id) REFERENCES users(institution_id, id) ON DELETE RESTRICT
 );
-CREATE INDEX idx_consolidated_results_cohort ON consolidated_student_results (institution_id, programme_id, academic_session_id, is_published);
-CREATE INDEX idx_consolidated_results_project ON consolidated_student_results (institution_id, project_id);
-CREATE INDEX idx_consolidated_results_student ON consolidated_student_results (institution_id, student_user_id, is_published);
 
 -- -----------------------------------------------------------------------------
 -- 8. MODULE M, O & P: NOTIFICATIONS, SCHEDULER, TAMPER-RESISTANT AUDIT & BACKUP
@@ -1239,7 +1131,6 @@ CREATE TABLE transactional_outbox_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ
 ) WITH (fillfactor = 80);
-CREATE INDEX idx_outbox_unprocessed ON transactional_outbox_events (created_at ASC) WHERE processed = FALSE;
 
 -- F-72: In-App Notifications
 CREATE TABLE in_app_notifications (
@@ -1254,7 +1145,6 @@ CREATE TABLE in_app_notifications (
     read_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX idx_in_app_notif_recipient ON in_app_notifications (recipient_user_id, is_read, created_at DESC);
 
 -- F-71, F-73, F-74, F-75: Asynchronous Notification Dispatch Queue & Retry Ledger
 CREATE TABLE notification_dispatch_jobs (
@@ -1276,8 +1166,6 @@ CREATE TABLE notification_dispatch_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 ) WITH (fillfactor = 80);
-CREATE INDEX idx_dispatch_jobs_retry ON notification_dispatch_jobs (status, next_retry_at) WHERE status IN ('PENDING', 'RETRY_SCHEDULED');
-CREATE INDEX idx_notif_dispatch_recipient ON notification_dispatch_jobs (recipient_user_id, created_at DESC);
 
 -- F-79 & F-80: Scheduled Deadline Reminder & Missed Deadline Detection Ledger
 CREATE TABLE scheduled_deadline_jobs (
@@ -1293,8 +1181,6 @@ CREATE TABLE scheduled_deadline_jobs (
     UNIQUE (project_id, milestone_id, effective_deadline_utc, job_type),
     FOREIGN KEY (institution_id, project_id) REFERENCES projects(institution_id, id) ON DELETE CASCADE
 );
-CREATE INDEX idx_scheduled_deadline_due ON scheduled_deadline_jobs (scheduled_trigger_utc, status) WHERE status = 'SCHEDULED';
-CREATE INDEX idx_scheduled_deadline_proj_lookup ON scheduled_deadline_jobs (institution_id, project_id, milestone_id, status);
 
 -- F-82: Tamper-Resistant Administrative & Critical Academic Audit Log (Append-Only Hash Chain)
 CREATE TABLE audit_logs (
@@ -1319,11 +1205,6 @@ CREATE TABLE audit_logs (
     row_integrity_hash CHAR(64) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX idx_audit_logs_tenant_time ON audit_logs (institution_id, created_at DESC);
-CREATE INDEX idx_audit_logs_programme_scope ON audit_logs (institution_id, programme_id, academic_session_id, created_at DESC);
-CREATE INDEX idx_audit_logs_hash_chain_tip ON audit_logs (COALESCE(institution_id, '00000000-0000-0000-0000-000000000000'::UUID), sequence_num DESC);
-CREATE INDEX idx_audit_logs_project_time ON audit_logs (institution_id, project_id, created_at DESC) WHERE project_id IS NOT NULL;
-CREATE INDEX idx_audit_logs_entity_lookup ON audit_logs (institution_id, target_entity_type, target_entity_id, created_at DESC);
 
 -- F-83: Hourly Backup & Disaster Recovery Verification Ledger (RPO <= 1h, RTO <= 4h)
 CREATE TABLE backup_recovery_logs (
@@ -1340,233 +1221,3 @@ CREATE TABLE backup_recovery_logs (
     status VARCHAR(30) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
     error_details TEXT
 );
-CREATE INDEX idx_backup_logs_status_time ON backup_recovery_logs (status, started_at DESC);
-
--- -----------------------------------------------------------------------------
--- 9. BUSINESS RULE & IMMUTABILITY TRIGGERS
--- -----------------------------------------------------------------------------
-
--- Trigger 1: Prevent Modification or Deletion of Append-Only Audit Logs (F-82, FR-282)
-CREATE OR REPLACE FUNCTION trg_enforce_audit_immutability() RETURNS TRIGGER AS $$
-BEGIN
-    IF TG_OP IN ('UPDATE', 'DELETE') THEN
-        RAISE EXCEPTION 'TAMPER_PROTECTION_VIOLATION: Audit log records in F-82 are strictly immutable and cannot be updated or deleted.';
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER enforce_audit_log_immutability
-BEFORE UPDATE OR DELETE ON audit_logs
-FOR EACH ROW EXECUTE FUNCTION trg_enforce_audit_immutability();
-
--- Trigger 2: Compute Concurrency-Safe Per-Tenant Cryptographic SHA-256 Hash Chain on Audit Log Insert (F-82)
-CREATE OR REPLACE FUNCTION trg_compute_audit_hash_chain() RETURNS TRIGGER AS $$
-DECLARE
-    v_prev_hash CHAR(64);
-    v_tenant_scope UUID := COALESCE(NEW.institution_id, '00000000-0000-0000-0000-000000000000'::UUID);
-BEGIN
-    -- Acquire transaction-scoped advisory lock per tenant to prevent hash chain forks under concurrency
-    PERFORM pg_advisory_xact_lock(hashtextextended(v_tenant_scope::TEXT, 2026));
-
-    SELECT row_integrity_hash INTO v_prev_hash
-    FROM audit_logs
-    WHERE COALESCE(institution_id, '00000000-0000-0000-0000-000000000000'::UUID) = v_tenant_scope
-    ORDER BY sequence_num DESC
-    LIMIT 1;
-
-    NEW.previous_row_hash := COALESCE(v_prev_hash, repeat('0', 64));
-    NEW.row_integrity_hash := encode(
-        digest(
-            NEW.previous_row_hash || '|' ||
-            v_tenant_scope::TEXT || '|' ||
-            COALESCE(NEW.actor_user_id::TEXT, 'SYSTEM') || '|' ||
-            NEW.action_code || '|' ||
-            COALESCE(NEW.previous_state_jsonb::TEXT, '') || '|' ||
-            COALESCE(NEW.resulting_state_jsonb::TEXT, '') || '|' ||
-            NEW.created_at::TEXT,
-            'sha256'
-        ),
-        'hex'
-    );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER compute_audit_hash_before_insert
-BEFORE INSERT ON audit_logs
-FOR EACH ROW EXECUTE FUNCTION trg_compute_audit_hash_chain();
-
--- Trigger 3: Prevent Deletion or File Overwrite of Preserved Submission Versions (BR-11, F-35, F-78)
-CREATE OR REPLACE FUNCTION trg_preserve_submission_versions() RETURNS TRIGGER AS $$
-BEGIN
-    IF TG_OP = 'DELETE' THEN
-        RAISE EXCEPTION 'VERSION_PRESERVATION_VIOLATION (BR-11 / DAT-02): Historical submission versions cannot be deleted.';
-    ELSIF TG_OP = 'UPDATE' THEN
-        IF NEW.storage_object_id <> OLD.storage_object_id OR NEW.version_number <> OLD.version_number OR NEW.server_receipt_at <> OLD.server_receipt_at THEN
-            RAISE EXCEPTION 'VERSION_PRESERVATION_VIOLATION (BR-11 / F-78): Immutable submission version metadata cannot be overwritten.';
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER preserve_submission_versions_trg
-BEFORE UPDATE OR DELETE ON submission_versions
-FOR EACH ROW EXECUTE FUNCTION trg_preserve_submission_versions();
-
--- Trigger 4: Enforce BR-04 & BR-05 (Block Supervisor Assignment Until Topic Proposal Exists)
-CREATE OR REPLACE FUNCTION trg_enforce_topic_before_supervisor() RETURNS TRIGGER AS $$
-DECLARE
-    v_topic_count INT;
-BEGIN
-    IF NEW.current_supervisor_user_id IS NOT NULL AND (OLD.current_supervisor_user_id IS NULL OR NEW.current_supervisor_user_id <> OLD.current_supervisor_user_id) THEN
-        SELECT COUNT(*) INTO v_topic_count
-        FROM topic_proposals
-        WHERE project_id = NEW.id AND institution_id = NEW.institution_id;
-
-        IF v_topic_count = 0 THEN
-            RAISE EXCEPTION 'BUSINESS_RULE_VIOLATION (BR-04 / BR-05): Cannot assign a Project Supervisor before a Topic Proposal has been submitted.';
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER enforce_topic_before_supervisor_trg
-BEFORE UPDATE ON projects
-FOR EACH ROW EXECUTE FUNCTION trg_enforce_topic_before_supervisor();
-
--- Trigger 5: Enforce BR-16 / F-48 (Supervisors Cannot Examine Projects They Currently or Formerly Supervised)
-CREATE OR REPLACE FUNCTION trg_enforce_examiner_independence() RETURNS TRIGGER AS $$
-DECLARE
-    v_supervised_count INT;
-BEGIN
-    SELECT COUNT(*) INTO v_supervised_count
-    FROM project_supervision_history
-    WHERE institution_id = NEW.institution_id
-      AND project_id = NEW.project_id
-      AND supervisor_user_id = NEW.examiner_user_id;
-
-    IF v_supervised_count > 0 THEN
-        RAISE EXCEPTION 'CONFLICT_OF_INTEREST_VIOLATION (BR-16 / F-48): User % is a current or former Supervisor of Project % and cannot be appointed as its Examiner.', NEW.examiner_user_id, NEW.project_id;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER enforce_examiner_independence_trg
-BEFORE INSERT OR UPDATE ON examiner_appointments
-FOR EACH ROW EXECUTE FUNCTION trg_enforce_examiner_independence();
-
--- Trigger 6: Enforce BR-21 & BR-NEW-03 / PROP-03 (Post-Approval Assessment Edit Safeguard & Post-Publication Lock)
--- Optimized: Avoids exclusive row locking on parent project during routine DRAFT autosaves
-CREATE OR REPLACE FUNCTION trg_handle_post_approval_assessment_edit() RETURNS TRIGGER AS $$
-DECLARE
-    v_proj_status result_approval_status_enum;
-BEGIN
-    IF OLD.status IN ('PENDING', 'DRAFT') AND NEW.status IN ('PENDING', 'DRAFT') THEN
-        SELECT result_approval_status INTO v_proj_status
-        FROM projects
-        WHERE id = NEW.project_id AND institution_id = NEW.institution_id;
-
-        IF v_proj_status = 'PUBLISHED' THEN
-            RAISE EXCEPTION 'PUBLICATION_LOCK_VIOLATION (BR-21): Assessments cannot be modified after publication.';
-        END IF;
-        RETURN NEW;
-    END IF;
-
-    SELECT result_approval_status INTO v_proj_status
-    FROM projects
-    WHERE id = NEW.project_id AND institution_id = NEW.institution_id
-    FOR NO KEY UPDATE;
-
-    IF v_proj_status = 'PUBLISHED' AND (OLD.status = 'PUBLISHED_LOCKED' OR NEW.status <> 'PUBLISHED_LOCKED') THEN
-        RAISE EXCEPTION 'PUBLICATION_LOCK_VIOLATION (BR-21): Assessments cannot be modified after the project result has been published.';
-    END IF;
-
-    IF TG_OP = 'UPDATE' AND OLD.status = 'SUBMITTED' AND v_proj_status = 'APPROVED_READY_FOR_PUBLICATION' THEN
-        IF NEW.edit_reason IS NULL OR char_length(NEW.edit_reason) < 10 THEN
-            RAISE EXCEPTION 'VALIDATION_ERROR: Editing a submitted assessment requires a mandatory edit_reason (min 10 chars).';
-        END IF;
-
-        UPDATE projects
-        SET result_approval_status = 'PENDING_COORDINATOR_REAPPROVAL',
-            updated_at = NOW()
-        WHERE id = NEW.project_id AND institution_id = NEW.institution_id;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER examiner_assessment_post_approval_safeguard
-BEFORE UPDATE ON examiner_assessments
-FOR EACH ROW EXECUTE FUNCTION trg_handle_post_approval_assessment_edit();
-
-CREATE TRIGGER supervisor_assessment_post_approval_safeguard
-BEFORE UPDATE ON supervisor_assessments
-FOR EACH ROW EXECUTE FUNCTION trg_handle_post_approval_assessment_edit();
-
--- -----------------------------------------------------------------------------
--- 10. CONFIDENTIALITY-SCOPED AUDIT VIEWS (F-08, F-18, FR-283)
--- -----------------------------------------------------------------------------
-
-CREATE OR REPLACE VIEW v_institutional_admin_audit_logs AS
-SELECT
-    id,
-    sequence_num,
-    institution_id,
-    actor_user_id,
-    actor_role,
-    action_code,
-    target_entity_type,
-    target_entity_id,
-    CASE WHEN is_confidential_academic_payload THEN '{"redacted": "CONFIDENTIAL_ACADEMIC_RECORD_BR_25"}'::JSONB ELSE previous_state_jsonb END AS previous_state_jsonb,
-    CASE WHEN is_confidential_academic_payload THEN '{"redacted": "CONFIDENTIAL_ACADEMIC_RECORD_BR_25"}'::JSONB ELSE resulting_state_jsonb END AS resulting_state_jsonb,
-    justification_reason,
-    outcome,
-    row_integrity_hash,
-    created_at
-FROM audit_logs
-WHERE institution_id = current_app_institution_id();
-
--- -----------------------------------------------------------------------------
--- 11. MANDATORY MULTI-TENANT ROW-LEVEL SECURITY (RLS) POLICIES (BR-01, SEC-09)
--- -----------------------------------------------------------------------------
-
-DO $$
-DECLARE
-    t_name TEXT;
-    tenant_tables TEXT[] := ARRAY[
-        'institutional_subscriptions', 'payment_transactions', 'faculties', 'departments',
-        'programmes', 'academic_sessions', 'user_role_assignments', 'coordinator_appointments',
-        'supervisor_records', 'projects', 'project_groups', 'student_project_registrations',
-        'project_group_members', 'topic_proposals', 'project_supervision_history',
-        'storage_objects', 'programme_milestones', 'project_milestone_states',
-        'submission_versions', 'submission_discussions', 'shared_group_documents',
-        'shared_group_document_revisions', 'deadline_extension_requests', 'late_penalty_rules',
-        'project_late_penalties', 'assessment_structures', 'examination_panels',
-        'examiner_appointments', 'defence_schedules', 'examiner_assessments',
-        'supervisor_assessments', 'consolidated_student_results', 'scheduled_deadline_jobs'
-    ];
-BEGIN
-    FOREACH t_name IN ARRAY tenant_tables LOOP
-        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', t_name);
-        EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', t_name);
-        EXECUTE format(
-            'CREATE POLICY tenant_isolation_policy ON %I FOR ALL TO clario_app_role '
-            'USING (institution_id = (SELECT current_app_institution_id())) '
-            'WITH CHECK (institution_id = (SELECT current_app_institution_id()));',
-            t_name
-        );
-    END LOOP;
-END
-$$;
-
--- Least-Privilege Grants for Application Role (Revokes UPDATE/DELETE on Audit & Immutable Version Tables)
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO clario_app_role;
-REVOKE UPDATE, DELETE ON audit_logs FROM clario_app_role;
-REVOKE DELETE ON submission_versions, storage_objects FROM clario_app_role;
-
-COMMIT;
