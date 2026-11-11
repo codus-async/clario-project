@@ -1,6 +1,12 @@
 export const ERROR_CODES = {
   UNAUTHORIZED_SESSION: "UNAUTHORIZED_SESSION",
+  UNAUTHENTICATED: "UNAUTHENTICATED",
+  SESSION_EXPIRED_OR_REVOKED: "SESSION_EXPIRED_OR_REVOKED",
+  ACCOUNT_TEMPORARILY_LOCKED: "ACCOUNT_TEMPORARILY_LOCKED",
   MFA_ENROLLMENT_REQUIRED: "MFA_ENROLLMENT_REQUIRED",
+  MFA_CHALLENGE_REQUIRED: "MFA_CHALLENGE_REQUIRED",
+  TENANT_SUSPENDED_F01: "TENANT_SUSPENDED_F01",
+  VALIDATION_ERROR: "VALIDATION_ERROR",
   CONFIDENTIAL_ACADEMIC_RECORD_BLOCKED:
     "CONFIDENTIAL_ACADEMIC_RECORD_BLOCKED",
   OUT_OF_ASSIGNMENT_SCOPE: "OUT_OF_ASSIGNMENT_SCOPE",
@@ -29,9 +35,33 @@ export const ERROR_METADATA: Record<
     status: 401,
     title: "Unauthorized Session",
   },
+  UNAUTHENTICATED: {
+    status: 401,
+    title: "Unauthenticated",
+  },
+  SESSION_EXPIRED_OR_REVOKED: {
+    status: 401,
+    title: "Session Expired or Revoked",
+  },
+  ACCOUNT_TEMPORARILY_LOCKED: {
+    status: 429,
+    title: "Account Temporarily Locked",
+  },
   MFA_ENROLLMENT_REQUIRED: {
     status: 403,
     title: "MFA Enrollment Required",
+  },
+  MFA_CHALLENGE_REQUIRED: {
+    status: 403,
+    title: "MFA Challenge Required",
+  },
+  TENANT_SUSPENDED_F01: {
+    status: 403,
+    title: "Tenant Suspended",
+  },
+  VALIDATION_ERROR: {
+    status: 400,
+    title: "Validation Error",
   },
   CONFIDENTIAL_ACADEMIC_RECORD_BLOCKED: {
     status: 403,
