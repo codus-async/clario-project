@@ -260,8 +260,6 @@ async function login(email: string, password = PASSWORD) {
     identifier: email,
     password,
     institutionCode: "TENA",
-    ip: "203.0.113.10",
-    userAgent: "vitest",
   });
 }
 

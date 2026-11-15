@@ -376,10 +376,16 @@ export function seedCoordinatorScopes(
 
 export const PASSWORD = "Correct-Horse-Battery-Staple-99!";
 
-export const LOGIN_PAYLOAD = {
+/** Documented `POST /api/v1/auth/login` request body (`LoginRequestDto`). */
+export const LOGIN_BODY = {
   identifier: "tunde.adewale@unilag.edu.ng",
   password: PASSWORD,
   institutionCode: "UNILAG",
+};
+
+/** Service-level login input: the body fields plus request metadata. */
+export const LOGIN_PAYLOAD = {
+  ...LOGIN_BODY,
   ip: "203.0.113.10",
   userAgent: "vitest",
 };
