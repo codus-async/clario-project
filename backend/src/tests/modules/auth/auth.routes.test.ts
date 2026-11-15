@@ -11,7 +11,7 @@ import {
 } from "../../../modules/auth/auth.middleware.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import {
-  LOGIN_PAYLOAD,
+  LOGIN_BODY,
   createFakeAuthFixture,
   seedInstitution,
   seedRoles,
@@ -69,7 +69,7 @@ async function login(
 ): Promise<{ sessionId: string; cookie: string }> {
   const response = await request(app)
     .post("/api/v1/auth/login")
-    .send(LOGIN_PAYLOAD);
+    .send(LOGIN_BODY);
 
   expect(response.status).toBe(200);
   const sessionId = String(response.body.session_id);
@@ -110,7 +110,7 @@ describe("POST /api/v1/auth/login", () => {
 
     const response = await request(app)
       .post("/api/v1/auth/login")
-      .send(LOGIN_PAYLOAD);
+      .send(LOGIN_BODY);
 
     expect(response.status).toBe(200);
     expect(response.body.session_id).toMatch(
@@ -163,7 +163,7 @@ describe("POST /api/v1/auth/login", () => {
 
     const response = await request(app)
       .post("/api/v1/auth/login")
-      .send({ ...LOGIN_PAYLOAD, password: "wrong" });
+      .send({ ...LOGIN_BODY, password: "wrong" });
 
     expect(response.status).toBe(401);
     expect(response.body.error.code).toBe("UNAUTHENTICATED");
@@ -178,7 +178,7 @@ describe("POST /api/v1/auth/login", () => {
 
     const response = await request(app)
       .post("/api/v1/auth/login")
-      .send(LOGIN_PAYLOAD);
+      .send(LOGIN_BODY);
 
     expect(response.status).toBe(429);
     expect(response.body.error.code).toBe("ACCOUNT_TEMPORARILY_LOCKED");
@@ -191,7 +191,7 @@ describe("POST /api/v1/auth/login", () => {
 
     const response = await request(app)
       .post("/api/v1/auth/login")
-      .send(LOGIN_PAYLOAD);
+      .send(LOGIN_BODY);
 
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe("VALIDATION_ERROR");
@@ -208,7 +208,7 @@ describe("POST /api/v1/auth/login", () => {
     const response = await request(app)
       .post("/api/v1/auth/login")
       .set("X-Clario-Active-Role", RoleCode.PROJECT_EXAMINER)
-      .send(LOGIN_PAYLOAD);
+      .send(LOGIN_BODY);
 
     expect(response.status).toBe(200);
     expect(response.body.active_role).toBe(RoleCode.PROJECT_EXAMINER);

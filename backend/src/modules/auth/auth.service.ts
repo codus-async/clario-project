@@ -38,9 +38,16 @@ import type {
   SessionState,
 } from "./auth.types.js";
 
-const MAX_IDENTIFIER_LENGTH = 320;
-const MAX_PASSWORD_LENGTH = 1024;
-const MAX_INSTITUTION_CODE_LENGTH = 64;
+/**
+ * Request-field bounds of the F-64 identifier/password/institution-code
+ * contract. Exported so the request-boundary Zod schemas
+ * (`auth.schemas.ts`) enforce exactly the constraints `AuthService` applies,
+ * keeping the HTTP edge and the application service in lock-step.
+ */
+export const MAX_IDENTIFIER_LENGTH = 320;
+export const MAX_PASSWORD_LENGTH = 1024;
+export const MAX_INSTITUTION_CODE_LENGTH = 64;
+
 const MAX_USER_AGENT_LENGTH = 1_000;
 
 const REVOKE_REASON_LOGOUT = "LOGOUT";
