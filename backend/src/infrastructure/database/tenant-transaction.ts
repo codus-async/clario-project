@@ -186,3 +186,66 @@ export async function withTenantTransaction<T>(
     return handler(tx);
   }, transactionOptions);
 }
+
+const uuidSchema = z.uuid();
+
+/**
+ * Institution-scoped transaction for pre-authentication reads (F-64).
+ *
+ * Login resolves role assignments and coordinator appointments before any
+ * session exists, so no `activeRole` / appointment context is available to
+ * satisfy {@link validateTenantContext}. This helper still binds the
+ * institution GUC (every `tenant_isolation_policy` rule is driven by
+ * `current_app_institution_id()`) and adopts the policy role, but deliberately
+ * leaves `app.active_role` and `app.active_coordinator_appointment_id` unset:
+ * any reader that depends on those variables observes NULL (fail-closed).
+ *
+ * Restricted to a single validated institution id so it can never be used for
+ * an unscoped cross-tenant read.
+ */
+export async function withInstitutionScopeTransaction<T>(
+  institutionId: string,
+  handler: (tx: Prisma.TransactionClient) => Promise<T>,
+  options: TenantTransactionOptions = {},
+): Promise<T> {
+  if (!uuidSchema.safeParse(institutionId).success) {
+    throw invalidContext([
+      {
+        field: "institutionId",
+        message: "institutionId must be a valid UUID to establish institution scope.",
+      },
+    ]);
+  }
+
+  const client = options.client ?? prisma;
+
+  const transactionOptions: {
+    isolationLevel?: Prisma.TransactionIsolationLevel;
+    maxWait?: number;
+    timeout?: number;
+  } = {};
+  if (options.isolationLevel !== undefined) {
+    transactionOptions.isolationLevel = options.isolationLevel;
+  }
+  if (options.maxWaitMs !== undefined) {
+    transactionOptions.maxWait = options.maxWaitMs;
+  }
+  if (options.timeoutMs !== undefined) {
+    transactionOptions.timeout = options.timeoutMs;
+  }
+
+  return client.$transaction(async (tx) => {
+    await tx.$queryRaw`
+      SELECT
+        set_config(${TENANT_CONTEXT_GUC.institutionId}, ${institutionId}, true),
+        set_config(${TENANT_CONTEXT_GUC.isPlatformAdmin}, ${String(false)}, true),
+        set_config(${TENANT_CONTEXT_GUC.activeRole}, ${""}, true),
+        set_config(${TENANT_CONTEXT_GUC.coordinatorAppointmentId}, ${""}, true)
+    `;
+
+    // APP_POLICY_ROLE is a module constant and never user input.
+    await tx.$executeRawUnsafe(`SET LOCAL ROLE ${APP_POLICY_ROLE}`);
+
+    return handler(tx);
+  }, transactionOptions);
+}
