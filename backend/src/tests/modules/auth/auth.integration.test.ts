@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { requestContextMiddleware } from "../../../middleware/request-context.middleware.js";
 import { errorHandler } from "../../../middleware/error-handler.js";
+import { AppError } from "../../../errors/app-error.js";
 import { PrismaClient } from "../../../generated/prisma/client.js";
 import { Argon2PasswordHasher } from "../../../infrastructure/auth/argon2-password-hasher.js";
 import {
@@ -26,6 +27,7 @@ import { RedisSessionStore } from "../../../infrastructure/auth/redis-session.st
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import { createRequireSession } from "../../../modules/auth/auth.middleware.js";
 import { AuthService } from "../../../modules/auth/auth.service.js";
+import type { PasswordHasher, VerificationSlot } from "../../../modules/auth/auth.ports.js";
 import { testAuthConfig } from "./auth.fakes.js";
 
 const BACKEND_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -41,6 +43,42 @@ const PASSWORD = "Correct-Horse-Battery-Staple-99!";
 const SUPERVISOR_EMAIL = "tunde.adewale@unilag.edu.ng";
 const COORDINATOR_EMAIL = "coordinator@unilag.edu.ng";
 
+/**
+ * Wraps the real Argon2id hasher to observe how many KDF invocations run in
+ * parallel — the direct proof that verification slots bound concurrent work.
+ */
+class CountingPasswordHasher implements PasswordHasher {
+  inFlight = 0;
+  maxInFlight = 0;
+  private readonly inner: Argon2PasswordHasher;
+
+  constructor(inner: Argon2PasswordHasher) {
+    this.inner = inner;
+  }
+
+  async hash(plain: string): Promise<string> {
+    return this.inner.hash(plain);
+  }
+
+  async verify(storedHash: string, plain: string): Promise<boolean> {
+    return this.track(() => this.inner.verify(storedHash, plain));
+  }
+
+  async verifyDummy(plain: string): Promise<boolean> {
+    return this.track(() => this.inner.verifyDummy(plain));
+  }
+
+  private async track<T>(fn: () => Promise<T>): Promise<T> {
+    this.inFlight += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    try {
+      return await fn();
+    } finally {
+      this.inFlight -= 1;
+    }
+  }
+}
+
 let pgContainer: StartedTestContainer;
 let redisContainer: StartedTestContainer;
 let sql: Client;
@@ -53,6 +91,8 @@ let supervisorId: string;
 let coordinatorId: string;
 let appointmentId: string;
 let supervisorPasswordHash: string;
+let countingHasher: CountingPasswordHasher;
+let authService: AuthService;
 
 function firstRow<T>(rows: readonly T[]): T {
   const row = rows[0];
@@ -97,7 +137,8 @@ beforeAll(async () => {
   }
 
   const hasher = new Argon2PasswordHasher();
-  supervisorPasswordHash = await hasher.hash(PASSWORD);
+  countingHasher = new CountingPasswordHasher(hasher);
+  supervisorPasswordHash = await countingHasher.hash(PASSWORD);
 
   const institutions = await sql.query<{ id: string }>(
     `INSERT INTO institutions (name, code_slug, primary_contact_name, primary_contact_email, account_status)
@@ -172,9 +213,9 @@ beforeAll(async () => {
   redis = new Redis(redisConnectionString, { lazyConnect: true });
   await redis.connect();
 
-  const authService = new AuthService({
+  authService = new AuthService({
     config: testAuthConfig,
-    hasher,
+    hasher: countingHasher,
     users: new PrismaUserRepository(db),
     institutions: new PrismaInstitutionRepository(db),
     roles: new PrismaRoleAssignmentRepository(db),
@@ -342,7 +383,7 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     expect(stillLocked.status).toBe(429);
 
     const lockTtl = await redis.ttl(
-      `clario:login:lock:${SUPERVISOR_EMAIL.toLowerCase()}`,
+      `clario:login:lock:id:${SUPERVISOR_EMAIL.toLowerCase()}`,
     );
     expect(lockTtl).toBeGreaterThan(0);
     expect(lockTtl).toBeLessThanOrEqual(15 * 60);
@@ -407,4 +448,249 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
     expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
   }, 120_000);
+
+  it("revokes sessions when the role assignment is revoked server-side", async () => {
+    const loginResponse = await login(SUPERVISOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    await sql.query(
+      `UPDATE user_role_assignments SET status = 'ARCHIVED', revoked_at = NOW()
+       WHERE user_id = $1 AND role_code = 'PROJECT_SUPERVISOR'`,
+      [supervisorId],
+    );
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("ROLE_REVOKED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+
+    await sql.query(
+      `UPDATE user_role_assignments SET status = 'ACTIVE', revoked_at = NULL
+       WHERE user_id = $1 AND role_code = 'PROJECT_SUPERVISOR'`,
+      [supervisorId],
+    );
+  }, 120_000);
+
+  it("revokes coordinator sessions when the appointment is revoked server-side", async () => {
+    const loginResponse = await login(COORDINATOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    await sql.query(
+      `UPDATE coordinator_appointments SET status = 'ARCHIVED', revoked_at = NOW()
+       WHERE id = $1`,
+      [appointmentId],
+    );
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("SCOPE_REVOKED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+
+    await sql.query(
+      `UPDATE coordinator_appointments SET status = 'ACTIVE', revoked_at = NULL
+       WHERE id = $1`,
+      [appointmentId],
+    );
+  }, 120_000);
+
+  it("bounds concurrent Argon2id verifications during a login burst", async () => {
+    countingHasher.maxInFlight = 0;
+
+    // Fire the burst directly at the service in a tight loop: every call
+    // reaches the lock check and the slot acquisition before any (slow) KDF
+    // can finish and record a failure, which is exactly the race the
+    // verification slots are meant to close.
+    const results = await Promise.allSettled(
+      Array.from({ length: 15 }, () =>
+        authService.login({
+          identifier: SUPERVISOR_EMAIL,
+          password: "wrong-password",
+          institutionCode: "TENA",
+          ip: "203.0.113.99",
+          userAgent: "vitest",
+        }),
+      ),
+    );
+
+    const isAppError = (
+      result: PromiseSettledResult<unknown>,
+      code: string,
+    ): boolean =>
+      result.status === "rejected" &&
+      result.reason instanceof AppError &&
+      result.reason.code === code;
+
+    const busyRejections = results.filter(
+      (result) =>
+        isAppError(result, "ACCOUNT_TEMPORARILY_LOCKED") &&
+        result.status === "rejected" &&
+        result.reason.message.includes("in progress"),
+    );
+    expect(busyRejections.length).toBeGreaterThan(0);
+
+    // The admitted attempts ran the KDF and failed the password check.
+    expect(results.filter((result) => isAppError(result, "UNAUTHENTICATED")).length).toBeGreaterThan(0);
+
+    // The KDF must never exceed LOGIN_MAX_CONCURRENT_VERIFICATIONS (5)
+    // parallel invocations for a single IP + identifier.
+    expect(countingHasher.maxInFlight).toBeLessThanOrEqual(5);
+    expect(countingHasher.maxInFlight).toBeGreaterThan(1);
+
+    // Clear the failures/lock recorded by the burst (and any slot tokens).
+    const protectionKeys = await redis.keys("clario:login:*");
+    if (protectionKeys.length > 0) {
+      await redis.del(...protectionKeys);
+    }
+    expect(await redis.keys("clario:login:*")).toHaveLength(0);
+  }, 120_000);
+});
+
+describe("RedisLoginProtectionStore verification slots", () => {
+  it("caps slots per IP/identifier dimension and frees them on release", async () => {
+    const store = new RedisLoginProtectionStore(redis, {
+      ...testAuthConfig.protection,
+      maxConcurrentVerifications: 2,
+      maxConcurrentVerificationsGlobal: 100,
+    });
+    const key = { ip: "198.51.100.50", identifier: "slots@example.edu" };
+
+    const first = await store.acquireVerificationSlot(key);
+    const second = await store.acquireVerificationSlot(key);
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+
+    // Same dimension at capacity: rejected without reserving a token.
+    expect(await store.acquireVerificationSlot(key)).toBeNull();
+
+    // A different identifier from the same IP still counts against the IP dim.
+    expect(
+      await store.acquireVerificationSlot({
+        ip: "198.51.100.50",
+        identifier: "other@example.edu",
+      }),
+    ).toBeNull();
+
+    // Release frees capacity for the next acquisition.
+    await store.releaseVerificationSlot(key, first as VerificationSlot);
+    const third = await store.acquireVerificationSlot(key);
+    expect(third).not.toBeNull();
+
+    const keys = await redis.keys("clario:login:conc:*");
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
+  }, 30_000);
+
+  it("enforces the process-wide cap across IPs and identifiers", async () => {
+    const store = new RedisLoginProtectionStore(redis, {
+      ...testAuthConfig.protection,
+      maxConcurrentVerifications: 100,
+      maxConcurrentVerificationsGlobal: 1,
+    });
+
+    const held = await store.acquireVerificationSlot({
+      ip: "198.51.100.60",
+      identifier: "one@example.edu",
+    });
+    expect(held).not.toBeNull();
+
+    expect(
+      await store.acquireVerificationSlot({
+        ip: "198.51.100.61",
+        identifier: "two@example.edu",
+      }),
+    ).toBeNull();
+
+    await store.releaseVerificationSlot(
+      { ip: "198.51.100.60", identifier: "one@example.edu" },
+      held as VerificationSlot,
+    );
+    expect(
+      await store.acquireVerificationSlot({
+        ip: "198.51.100.61",
+        identifier: "two@example.edu",
+      }),
+    ).not.toBeNull();
+
+    const keys = await redis.keys("clario:login:conc:*");
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
+  }, 30_000);
+
+  it("keeps identifier keys disjoint from IP keys", async () => {
+    const store = new RedisLoginProtectionStore(redis, {
+      ...testAuthConfig.protection,
+      maxConcurrentVerifications: 100,
+      maxConcurrentVerificationsGlobal: 1_000,
+    });
+    const victimIp = "198.51.100.99";
+    // A crafted identifier that looks like the IP namespace must not be able
+    // to write the victim IP's lock/locklevel keys.
+    const crafted = { ip: "203.0.113.77", identifier: `ip:${victimIp}` };
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await store.recordFailure(crafted);
+    }
+    const lockedForCrafted = await store.check(crafted);
+    expect(lockedForCrafted.locked).toBe(true);
+
+    expect(await redis.exists(`clario:login:lock:id:ip:${victimIp}`)).toBe(1);
+    expect(await redis.exists(`clario:login:lock:ip:${victimIp}`)).toBe(0);
+    expect(await redis.exists(`clario:login:locklevel:ip:${victimIp}`)).toBe(0);
+
+    // The victim IP itself must still be able to authenticate.
+    const victimView = await store.check({
+      ip: victimIp,
+      identifier: "someone-else@example.edu",
+    });
+    expect(victimView.locked).toBe(false);
+
+    const keys = await redis.keys("clario:login:*");
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
+  }, 30_000);
+
+  it("clears only the identifier dimension on a successful login", async () => {
+    const store = new RedisLoginProtectionStore(redis, {
+      ...testAuthConfig.protection,
+      maxConcurrentVerifications: 100,
+      maxConcurrentVerificationsGlobal: 1_000,
+    });
+    const key = { ip: "198.51.100.88", identifier: "winner@example.edu" };
+
+    await store.recordFailure(key);
+    await store.recordFailure(key);
+    expect(await redis.exists("clario:login:fail:ip:198.51.100.88")).toBe(1);
+    expect(await redis.exists("clario:login:fail:id:winner@example.edu")).toBe(
+      1,
+    );
+
+    await store.recordSuccess(key);
+
+    expect(await redis.exists("clario:login:fail:id:winner@example.edu")).toBe(
+      0,
+    );
+    // The shared IP window is left to decay on its own so one valid
+    // credential cannot reset a cross-account spray counter.
+    expect(await redis.exists("clario:login:fail:ip:198.51.100.88")).toBe(1);
+
+    const keys = await redis.keys("clario:login:*");
+    if (keys.length > 0) {
+      await redis.del(...keys);
+    }
+  }, 30_000);
 });

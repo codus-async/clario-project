@@ -71,8 +71,11 @@ export function createRequireSession(
 
 /**
  * Route guard for endpoints that require a fully authenticated MFA state
- * (SEC-06, FR-048): the active role must either not require MFA or the
- * session must have completed MFA verification.
+ * (SEC-06, FR-048, FR-222): MFA verification is required when either the
+ * account is flagged `mfa_required` or the session's active role is one of
+ * `MANDATORY_MFA_ROLES`. Checking both matters because `mfaRequired` in the
+ * session context can be true for an active role that is *not* on the
+ * mandatory list (e.g. the account previously held an admin role).
  */
 export const createRequireMfaVerified: RequestHandler = (req, _res, next) => {
   const context = req.authContext;
@@ -87,7 +90,8 @@ export const createRequireMfaVerified: RequestHandler = (req, _res, next) => {
   }
 
   if (
-    MANDATORY_MFA_ROLES.includes(context.activeRole) &&
+    (context.mfaRequired ||
+      MANDATORY_MFA_ROLES.includes(context.activeRole)) &&
     !context.mfaVerified
   ) {
     next(

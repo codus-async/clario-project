@@ -22,6 +22,7 @@ import type {
   SessionRepository,
   SessionStore,
   UserRepository,
+  VerificationSlot,
 } from "../../../modules/auth/auth.ports.js";
 import { AuthService } from "../../../modules/auth/auth.service.js";
 import type { SessionState } from "../../../modules/auth/auth.types.js";
@@ -38,15 +39,20 @@ export const testAuthConfig: AuthConfig = resolveAuthConfig(
 );
 
 export class FakePasswordHasher implements PasswordHasher {
+  verifyCalls = 0;
+  dummyCalls = 0;
+
   async hash(plain: string): Promise<string> {
     return `fake-argon2id$${plain}`;
   }
 
   async verify(storedHash: string, plain: string): Promise<boolean> {
+    this.verifyCalls += 1;
     return storedHash === `fake-argon2id$${plain}`;
   }
 
   async verifyDummy(): Promise<boolean> {
+    this.dummyCalls += 1;
     return false;
   }
 }
@@ -98,11 +104,17 @@ export class FakeInstitutionRepository implements InstitutionRepository {
 export class FakeRoleAssignmentRepository implements RoleAssignmentRepository {
   roles = new Map<string, RoleCode[]>();
   coordinatorScopes = new Map<string, CoordinatorScopeContext[]>();
+  /** Simulates a datastore outage during role/scope revalidation. */
+  findActiveRolesShouldFail = false;
+  findCoordinatorScopesShouldFail = false;
 
   async findActiveRoles(
     userId: UUID,
     institutionId: UUID,
   ): Promise<RoleCode[]> {
+    if (this.findActiveRolesShouldFail) {
+      throw new Error("postgres unavailable");
+    }
     return [...(this.roles.get(`${userId}:${institutionId}`) ?? [])];
   }
 
@@ -110,6 +122,9 @@ export class FakeRoleAssignmentRepository implements RoleAssignmentRepository {
     userId: UUID,
     institutionId: UUID,
   ): Promise<CoordinatorScopeContext[]> {
+    if (this.findCoordinatorScopesShouldFail) {
+      throw new Error("postgres unavailable");
+    }
     return [
       ...(this.coordinatorScopes.get(`${userId}:${institutionId}`) ?? []),
     ];
@@ -124,6 +139,7 @@ interface StoredSessionRow extends NewSessionRow {
 export class FakeSessionRepository implements SessionRepository {
   rows = new Map<string, StoredSessionRow>();
   createShouldFail = false;
+  markRevokedShouldFail = false;
 
   async create(row: NewSessionRow): Promise<void> {
     if (this.createShouldFail) {
@@ -141,6 +157,9 @@ export class FakeSessionRepository implements SessionRepository {
   }
 
   async markRevoked(sessionId: UUID, reason: string): Promise<void> {
+    if (this.markRevokedShouldFail) {
+      throw new Error("postgres unavailable");
+    }
     const row = this.rows.get(sessionId);
     if (row !== undefined) {
       row.isRevoked = true;
@@ -160,6 +179,7 @@ export class FakeSessionStore implements SessionStore {
   states = new Map<string, SessionState>();
   ttls = new Map<string, number>();
   setShouldFail = false;
+  deleteShouldFail = false;
 
   async get(sessionId: UUID): Promise<SessionState | null> {
     return this.states.get(sessionId) ?? null;
@@ -174,6 +194,9 @@ export class FakeSessionStore implements SessionStore {
   }
 
   async delete(sessionId: UUID): Promise<void> {
+    if (this.deleteShouldFail) {
+      throw new Error("redis unavailable");
+    }
     this.states.delete(sessionId);
     this.ttls.delete(sessionId);
   }
@@ -184,6 +207,13 @@ export class FakeProtectionStore implements LoginProtectionStore {
   retryAfterSeconds: number | null = null;
   failures: Array<{ ip: string; identifier: string }> = [];
   successes: Array<{ ip: string; identifier: string }> = [];
+  /** Set to a finite number to simulate an exhausted verification cap. */
+  maxConcurrentVerifications: number = Number.POSITIVE_INFINITY;
+  acquireCalls = 0;
+  releaseCalls = 0;
+  acquireShouldFail = false;
+  private readonly heldTokens = new Set<string>();
+  private tokenCounter = 0;
 
   async check(): Promise<ProtectionCheckResult> {
     return {
@@ -198,6 +228,28 @@ export class FakeProtectionStore implements LoginProtectionStore {
 
   async recordSuccess(input: { ip: string; identifier: string }): Promise<void> {
     this.successes.push(input);
+  }
+
+  async acquireVerificationSlot(): Promise<VerificationSlot | null> {
+    this.acquireCalls += 1;
+    if (this.acquireShouldFail) {
+      throw new Error("redis unavailable");
+    }
+    if (this.heldTokens.size >= this.maxConcurrentVerifications) {
+      return null;
+    }
+    this.tokenCounter += 1;
+    const token = `slot-${String(this.tokenCounter)}`;
+    this.heldTokens.add(token);
+    return { token };
+  }
+
+  async releaseVerificationSlot(
+    _input: { ip: string; identifier: string },
+    slot: VerificationSlot,
+  ): Promise<void> {
+    this.releaseCalls += 1;
+    this.heldTokens.delete(slot.token);
   }
 }
 

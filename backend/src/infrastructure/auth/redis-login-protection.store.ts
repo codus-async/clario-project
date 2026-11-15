@@ -5,15 +5,74 @@ import type { Redis } from "ioredis";
 import type {
   LoginProtectionStore,
   ProtectionCheckResult,
+  VerificationSlot,
 } from "../../modules/auth/auth.ports.js";
 import type { LoginProtectionConfig } from "../../modules/auth/auth.config.js";
 
 const FAIL_IP_PREFIX = "clario:login:fail:ip:";
 const FAIL_IDENTIFIER_PREFIX = "clario:login:fail:id:";
+// Identifier namespaces must be disjoint from the `ip:` namespaces: an
+// identifier is an arbitrary user-supplied string, so an identifier such as
+// `ip:203.0.113.7` must never be able to write the IP's own keys.
 const LOCK_IP_PREFIX = "clario:login:lock:ip:";
-const LOCK_IDENTIFIER_PREFIX = "clario:login:lock:";
+const LOCK_IDENTIFIER_PREFIX = "clario:login:lock:id:";
 const LEVEL_IP_PREFIX = "clario:login:locklevel:ip:";
-const LEVEL_IDENTIFIER_PREFIX = "clario:login:locklevel:";
+const LEVEL_IDENTIFIER_PREFIX = "clario:login:locklevel:id:";
+const CONC_IP_PREFIX = "clario:login:conc:ip:";
+const CONC_IDENTIFIER_PREFIX = "clario:login:conc:id:";
+const CONC_GLOBAL_KEY = "clario:login:conc:global";
+
+/**
+ * Lifetime of one verification slot. Generous enough to cover an Argon2id
+ * verification (plus a few queries) and short enough that a crashed process
+ * cannot pin slots for long: tokens score their deadline and are pruned on
+ * the next acquire.
+ */
+const VERIFICATION_SLOT_TTL_MS = 30_000;
+
+/**
+ * Atomically reserves one verification slot in each of the three dimensions
+ * (per-IP, per-identifier, process-wide). Returns 0 when any dimension is at
+ * capacity, 1 when the reservation succeeded.
+ *
+ * KEYS[1] = per-IP key, KEYS[2] = per-identifier key, KEYS[3] = global key.
+ * ARGV    = now, deadline, per-dimension max, global max, token, pttl.
+ */
+const ACQUIRE_VERIFICATION_SLOT_LUA = `
+local now = tonumber(ARGV[1])
+local deadline = tonumber(ARGV[2])
+local dimensionMax = tonumber(ARGV[3])
+local globalMax = tonumber(ARGV[4])
+local token = ARGV[5]
+local pttl = tonumber(ARGV[6])
+
+for i = 1, #KEYS do
+  redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', now)
+end
+
+for i = 1, 2 do
+  if redis.call('ZCARD', KEYS[i]) >= dimensionMax then
+    return 0
+  end
+end
+if redis.call('ZCARD', KEYS[3]) >= globalMax then
+  return 0
+end
+
+for i = 1, #KEYS do
+  redis.call('ZADD', KEYS[i], deadline, token)
+  redis.call('PEXPIRE', KEYS[i], pttl)
+end
+return 1
+`;
+
+/** Best-effort release: removes the token from every dimension. */
+const RELEASE_VERIFICATION_SLOT_LUA = `
+for i = 1, #KEYS do
+  redis.call('ZREM', KEYS[i], ARGV[1])
+end
+return 1
+`;
 
 /**
  * Redis sliding-window login protection (SEC-04, SEC-05).
@@ -23,8 +82,11 @@ const LEVEL_IDENTIFIER_PREFIX = "clario:login:locklevel:";
  * When a dimension crosses the threshold it is locked for an escalating
  * cooldown (15 → 30 → 60 minutes, capped by configuration). Counters are
  * incremented even for identifiers that do not exist, so lockout behaviour
- * cannot be used as an account-enumeration oracle, and a successful login
- * clears both dimensions.
+ * cannot be used as an account-enumeration oracle. A successful login clears
+ * the identifier dimension only: the IP window is shared by every account
+ * behind the same client, so resetting it on success would let an attacker
+ * with one valid credential wipe the cross-account spray counter at will; IP
+ * counters decay with their own sliding window instead.
  */
 export class RedisLoginProtectionStore implements LoginProtectionStore {
   private readonly client: Redis;
@@ -85,15 +147,62 @@ export class RedisLoginProtectionStore implements LoginProtectionStore {
   }
 
   async recordSuccess(input: { ip: string; identifier: string }): Promise<void> {
-    const ip = normalizeIp(input.ip);
+    // Only the identifier dimension is reset. Clearing the shared IP window
+    // here would allow an attacker who owns one valid account to spray other
+    // accounts from the same IP, log in to their own account between waves,
+    // and keep the IP counter below the threshold indefinitely.
     await this.client.del(
-      this.failIpKey(ip),
       this.failIdentifierKey(input.identifier),
-      this.lockIpKey(ip),
       this.lockIdentifierKey(input.identifier),
-      this.levelIpKey(ip),
       this.levelIdentifierKey(input.identifier),
     );
+  }
+
+  async acquireVerificationSlot(input: {
+    ip: string;
+    identifier: string;
+  }): Promise<VerificationSlot | null> {
+    const token = randomUUID();
+    const now = Date.now();
+    const keys = this.verificationSlotKeys(input);
+    const outcome = await this.client.eval(
+      ACQUIRE_VERIFICATION_SLOT_LUA,
+      keys.length,
+      ...keys,
+      String(now),
+      String(now + VERIFICATION_SLOT_TTL_MS),
+      String(this.config.maxConcurrentVerifications),
+      String(this.config.maxConcurrentVerificationsGlobal),
+      token,
+      String(VERIFICATION_SLOT_TTL_MS + 5_000),
+    );
+    return Number(outcome) === 1 ? { token } : null;
+  }
+
+  async releaseVerificationSlot(
+    input: { ip: string; identifier: string },
+    slot: VerificationSlot,
+  ): Promise<void> {
+    const keys = this.verificationSlotKeys(input);
+    try {
+      await this.client.eval(
+        RELEASE_VERIFICATION_SLOT_LUA,
+        keys.length,
+        ...keys,
+        slot.token,
+      );
+    } catch {
+      // The slot expires on its own (scored deadline); a failed release only
+      // holds capacity for the remainder of the TTL.
+    }
+  }
+
+  private verificationSlotKeys(input: { ip: string; identifier: string }): string[] {
+    return [
+      `${CONC_IP_PREFIX}${normalizeIp(input.ip)}`,
+      `${CONC_IDENTIFIER_PREFIX}${input.identifier}`,
+      CONC_GLOBAL_KEY,
+    ];
   }
 
   private failIpKey(ip: string): string {

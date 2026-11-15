@@ -99,6 +99,26 @@ describe("EnvironmentSchema", () => {
       expect(result.data.APP_TIMEZONE).toBe("Africa/Lagos");
     }
   });
+
+  it("rejects a lockout max cooldown below the base cooldown", () => {
+    const result = EnvironmentSchema.safeParse({
+      ...validEnv,
+      LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: "120",
+      LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES: "60",
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a lockout max cooldown equal to the base cooldown", () => {
+    const result = EnvironmentSchema.safeParse({
+      ...validEnv,
+      LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: "60",
+      LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES: "60",
+    });
+
+    expect(result.success).toBe(true);
+  });
 });
 
 describe("env module load", () => {

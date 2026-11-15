@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 import {
   MANDATORY_MFA_ROLES,
   RoleCode,
+  type CoordinatorScopeContext,
   type UUID,
 } from "@clario/shared-contracts";
 
@@ -26,6 +27,7 @@ import type {
   SessionRepository,
   SessionStore,
   UserRepository,
+  VerificationSlot,
 } from "./auth.ports.js";
 import type {
   AuthSessionContext,
@@ -48,6 +50,8 @@ const REVOKE_REASON_RUNTIME_PERSISTENCE =
   "SESSION_RUNTIME_PERSISTENCE_FAILED";
 const REVOKE_REASON_ACCOUNT_INELIGIBLE = "ACCOUNT_INELIGIBLE";
 const REVOKE_REASON_TENANT_SUSPENDED = "TENANT_SUSPENDED";
+const REVOKE_REASON_ROLE_REVOKED = "ROLE_REVOKED";
+const REVOKE_REASON_SCOPE_REVOKED = "SCOPE_REVOKED";
 
 export interface AuthServiceDeps {
   config: AuthConfig;
@@ -85,6 +89,26 @@ function lockedOut(retryAfterSeconds: number | null): AppError {
       ? `Too many failed attempts. Try again in ${String(retryAfterSeconds)} seconds.`
       : "Too many failed attempts. Try again after the temporary lockout expires.";
   return new AppError(ERROR_CODES.ACCOUNT_TEMPORARILY_LOCKED, detail);
+}
+
+/**
+ * Rejection emitted when the in-flight verification cap is reached. It is
+ * thrown *before* any account lookup, so it behaves identically for every
+ * identifier (no enumeration oracle) and records no failure against the
+ * sliding window.
+ */
+function verificationBusy(): AppError {
+  return new AppError(
+    ERROR_CODES.ACCOUNT_TEMPORARILY_LOCKED,
+    "Too many login attempts are in progress. Please try again shortly.",
+  );
+}
+
+function sessionRevoked(): AppError {
+  return new AppError(
+    ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    "The session is invalid, expired, or has been revoked.",
+  );
 }
 
 function scopeDenied(detail: string): AppError {
@@ -133,6 +157,65 @@ export class AuthService {
     };
 
     await this.assertNotLocked(protectionKey);
+
+    // Reserve a verification slot *before* any account lookup or KDF work so
+    // a concurrent burst cannot exhaust backend memory before failures are
+    // recorded (review finding P1). Released on every path below.
+    let slot: VerificationSlot | null;
+    try {
+      slot = await this.protection.acquireVerificationSlot(protectionKey);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth" },
+        "Failed to acquire verification slot",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "Login is temporarily unavailable. Please try again.",
+      );
+    }
+    if (slot === null) {
+      throw verificationBusy();
+    }
+
+    try {
+      return await this.completeLogin(input, {
+        identifier,
+        password,
+        institutionCode,
+        activeRoleHeader,
+        coordinatorAppointmentHeader,
+        protectionKey,
+      });
+    } finally {
+      await this.releaseVerificationSlot(protectionKey, slot);
+    }
+  }
+
+  /**
+   * Post-lock-check login flow, executed while a verification slot is held.
+   * Extracted from {@link AuthService.login} so the slot is released on every
+   * exit path (success, rejected login, thrown validation/scope error).
+   */
+  private async completeLogin(
+    input: LoginInput,
+    context: {
+      identifier: string;
+      password: string;
+      institutionCode: string | undefined;
+      activeRoleHeader: string | undefined;
+      coordinatorAppointmentHeader: string | undefined;
+      protectionKey: { ip: string; identifier: string };
+    },
+  ): Promise<LoginResult> {
+    const {
+      identifier,
+      password,
+      institutionCode,
+      activeRoleHeader,
+      coordinatorAppointmentHeader,
+      protectionKey,
+    } = context;
 
     // Tenant resolution (anti-enumeration: an unknown institution code fails
     // with the same generic error as a wrong password).
@@ -188,7 +271,10 @@ export class AuthService {
       password,
     );
     if (!passwordValid) {
-      await this.noteLoginFailure(protectionKey, password);
+      // The real verification already performed the constant Argon2id work;
+      // burning a dummy hash as well would double the KDF time for real
+      // accounts and re-enable timing-based enumeration (SEC-04).
+      await this.recordLoginFailure(protectionKey);
       throw authenticationFailed();
     }
     await this.recordLoginSuccess(protectionKey);
@@ -331,7 +417,16 @@ export class AuthService {
   // -------------------------------------------------------------------------
 
   async logout(sessionId: UUID): Promise<void> {
-    await this.revokeSession(sessionId, REVOKE_REASON_LOGOUT);
+    const result = await this.revokeSession(sessionId, REVOKE_REASON_LOGOUT);
+    // A single failed write is still safe: the Redis/PostgreSQL cross-check
+    // fails closed on the next request. If *neither* write lands the session
+    // stays fully usable, so the caller must not be told the logout succeeded.
+    if (!result.rowRevoked && !result.stateCleared) {
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "The session could not be logged out. Please try again.",
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -360,7 +455,8 @@ export class AuthService {
    * Resolves the session behind `cookie` / `Authorization: Bearer`
    * credentials, enforces absolute and inactivity expiry, cross-checks the
    * Redis state against the authoritative `user_sessions` row, re-checks
-   * account and tenant eligibility, and refreshes activity.
+   * account, tenant, and role/appointment eligibility (FR-227), and refreshes
+   * activity.
    */
   async resolveSession(
     credential: SessionCredential,
@@ -391,6 +487,10 @@ export class AuthService {
       }
     }
 
+    // Revalidate role assignments and coordinator scope *before* refreshing
+    // activity, so a revoked session is never extended (FR-227 item 5).
+    await this.assertRoleScopeStillValid(state);
+
     const now = Date.now();
     const refreshed = this.refreshActivity(state, now);
     await this.persistActivity(sessionId, refreshed, now);
@@ -401,6 +501,111 @@ export class AuthService {
   // -------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------
+
+  /**
+   * FR-227 item 5: revalidate the session's role assignments — and, for a
+   * Project Coordinator, appointment scope — against the authoritative tables
+   * on every request so revocations take effect immediately instead of at
+   * session expiry. Only *removals* revoke the session: roles granted after
+   * login are picked up at the next authentication (live role switching is
+   * F-65).
+   *
+   * A datastore failure fails the request with 503 but never revokes: a
+   * transient database blip must not log every user out.
+   */
+  private async assertRoleScopeStillValid(state: SessionState): Promise<void> {
+    const institutionId = state.institutionId;
+    if (institutionId === null) {
+      // Platform admins are not tenant-scoped; account status (already
+      // checked above) is their only eligibility signal.
+      return;
+    }
+
+    const freshRoles = await this.loadRolesForRevalidation(
+      state.userId,
+      institutionId,
+    );
+    const freshRoleSet = new Set(freshRoles);
+    const activeRoleStillAssigned = freshRoleSet.has(state.activeRole);
+    const noRoleRemoved = state.assignedRoles.every((role) =>
+      freshRoleSet.has(role),
+    );
+    if (!activeRoleStillAssigned || !noRoleRemoved) {
+      await this.revokeSession(state.sessionId, REVOKE_REASON_ROLE_REVOKED);
+      throw sessionRevoked();
+    }
+
+    if (state.activeRole !== RoleCode.PROJECT_COORDINATOR) {
+      return;
+    }
+
+    const freshScopes = await this.loadCoordinatorScopesForRevalidation(
+      state.userId,
+      institutionId,
+    );
+    const freshAppointmentIds = new Set(
+      freshScopes.map((scope) => scope.appointmentId),
+    );
+    const noScopeRemoved = state.coordinatorAppointments.every((scope) =>
+      freshAppointmentIds.has(scope.appointmentId),
+    );
+    if (!noScopeRemoved) {
+      await this.revokeSession(state.sessionId, REVOKE_REASON_SCOPE_REVOKED);
+      throw sessionRevoked();
+    }
+  }
+
+  private async loadRolesForRevalidation(
+    userId: UUID,
+    institutionId: UUID,
+  ): Promise<RoleCode[]> {
+    try {
+      return await this.roles.findActiveRoles(userId, institutionId);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth" },
+        "Role revalidation query failed",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "The request could not be completed. Please try again.",
+      );
+    }
+  }
+
+  private async loadCoordinatorScopesForRevalidation(
+    userId: UUID,
+    institutionId: UUID,
+  ): Promise<CoordinatorScopeContext[]> {
+    try {
+      return await this.roles.findCoordinatorScopes(userId, institutionId);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth" },
+        "Coordinator scope revalidation query failed",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "The request could not be completed. Please try again.",
+      );
+    }
+  }
+
+  private async releaseVerificationSlot(
+    key: { ip: string; identifier: string },
+    slot: VerificationSlot,
+  ): Promise<void> {
+    try {
+      await this.protection.releaseVerificationSlot(key, slot);
+    } catch (error) {
+      // The slot expires on its own; a failed release only holds capacity for
+      // the remainder of the TTL.
+      baseLogger.warn(
+        { err: error, module: "auth" },
+        "Failed to release verification slot",
+      );
+    }
+  }
 
   private resolveSessionId(credential: SessionCredential): UUID {
     const { cookieSessionId, bearerSessionId } = credential;
@@ -507,23 +712,28 @@ export class AuthService {
   private async revokeSession(
     sessionId: UUID,
     reason: string,
-  ): Promise<void> {
+  ): Promise<{ rowRevoked: boolean; stateCleared: boolean }> {
+    let rowRevoked = false;
     try {
       await this.sessions.markRevoked(sessionId, reason);
+      rowRevoked = true;
     } catch (error) {
       baseLogger.warn(
         { err: error, module: "auth", reason },
         "Failed to revoke session row",
       );
     }
+    let stateCleared = false;
     try {
       await this.sessionStore.delete(sessionId);
+      stateCleared = true;
     } catch (error) {
       baseLogger.warn(
         { err: error, module: "auth", reason },
         "Failed to delete runtime session state",
       );
     }
+    return { rowRevoked, stateCleared };
   }
 
   private async assertNotLocked(key: {

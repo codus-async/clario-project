@@ -37,7 +37,14 @@ export class Argon2PasswordHasher implements PasswordHasher {
     this.dummyHash ??= hash(
       randomBytes(16).toString("hex"),
       ARGON2ID_OPTIONS,
-    );
+    ).catch((error: unknown) => {
+      // Never cache a rejected promise: every later verifyDummy would then
+      // fail in microseconds, and unknown identifiers would respond much
+      // faster than real wrong passwords (an enumeration oracle). Clear the
+      // cache so the next call retries the hash computation.
+      this.dummyHash = null;
+      throw error;
+    });
     try {
       await verify(await this.dummyHash, plain);
     } catch {

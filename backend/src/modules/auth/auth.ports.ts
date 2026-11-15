@@ -110,8 +110,31 @@ export interface ProtectionCheckResult {
   retryAfterSeconds: number | null;
 }
 
+/**
+ * Reservation for one in-flight Argon2id verification. Slots are acquired
+ * *before* the KDF runs and released once the request finishes, so the
+ * configured caps bound concurrent memory/CPU even when no failure has been
+ * recorded yet (review finding P1).
+ */
+export interface VerificationSlot {
+  token: string;
+}
+
 export interface LoginProtectionStore {
   check(input: { ip: string; identifier: string }): Promise<ProtectionCheckResult>;
   recordFailure(input: { ip: string; identifier: string }): Promise<void>;
   recordSuccess(input: { ip: string; identifier: string }): Promise<void>;
+  /**
+   * Reserves a verification slot for the IP, identifier and process-wide
+   * dimensions. Returns `null` when any dimension is at capacity (the caller
+   * must reject without running the KDF). Throws when Redis is unavailable.
+   */
+  acquireVerificationSlot(
+    input: { ip: string; identifier: string },
+  ): Promise<VerificationSlot | null>;
+  /** Releases a previously acquired slot. Best-effort: failures are logged. */
+  releaseVerificationSlot(
+    input: { ip: string; identifier: string },
+    slot: VerificationSlot,
+  ): Promise<void>;
 }

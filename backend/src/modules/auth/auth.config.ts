@@ -21,6 +21,10 @@ export interface LoginProtectionConfig {
   baseCooldownMinutes: number;
   cooldownMultiplier: number;
   maxCooldownMinutes: number;
+  /** Max concurrent Argon2id verifications per IP and per identifier. */
+  maxConcurrentVerifications: number;
+  /** Process-wide max concurrent Argon2id verifications. */
+  maxConcurrentVerificationsGlobal: number;
 }
 
 export interface AuthConfig {
@@ -60,6 +64,9 @@ export function resolveAuthConfig(env: Environment): AuthConfig {
       baseCooldownMinutes: env.LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES,
       cooldownMultiplier: env.LOGIN_LOCKOUT_COOLDOWN_MULTIPLIER,
       maxCooldownMinutes: env.LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES,
+      maxConcurrentVerifications: env.LOGIN_MAX_CONCURRENT_VERIFICATIONS,
+      maxConcurrentVerificationsGlobal:
+        env.LOGIN_MAX_CONCURRENT_VERIFICATIONS_GLOBAL,
     }),
   });
 }

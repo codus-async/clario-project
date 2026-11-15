@@ -81,6 +81,30 @@ async function login(
 }
 
 describe("POST /api/v1/auth/login", () => {
+  it("returns 400 for a malformed JSON body", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .set("Content-Type", "application/json")
+      .send("{bad json");
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.detail).toContain("not valid JSON");
+  });
+
+  it("returns 413 when the body exceeds the size limit", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ identifier: "a@b.com", padding: "x".repeat(150_000) });
+
+    expect(response.status).toBe(413);
+    expect(response.body.error.code).toBe("PAYLOAD_TOO_LARGE");
+  });
+
   it("returns the session payload and sets the clario_sid cookie", async () => {
     const app = buildApp(seededFixture());
 
@@ -395,5 +419,26 @@ describe("createRequireMfaVerified", () => {
       .set("Cookie", cookie);
 
     expect(response.status).toBe(200);
+  });
+
+  it("blocks account-level mfa_required sessions for non-mandatory roles", async () => {
+    // The account is flagged mfa_required (e.g. it previously held an admin
+    // role) but the active role is a supervisor, which is not in
+    // MANDATORY_MFA_ROLES. The account-level flag must still gate access.
+    const fixture = seededFixture([RoleCode.PROJECT_SUPERVISOR]);
+    const user = fixture.users.users[0];
+    expect(user).toBeDefined();
+    if (user !== undefined) {
+      user.mfaRequired = true;
+    }
+    const app = buildApp(fixture);
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .get("/admin-only")
+      .set("Cookie", cookie);
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("MFA_CHALLENGE_REQUIRED");
   });
 });

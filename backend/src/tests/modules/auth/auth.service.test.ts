@@ -637,6 +637,69 @@ describe("AuthService.logout", () => {
     expect(row?.revokedReason).toBe("LOGOUT");
     expect(fixture.sessionStore.states.has(login.sessionId)).toBe(false);
   });
+
+  it("fails with 503 when neither revocation write lands", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.sessions.markRevokedShouldFail = true;
+    fixture.sessionStore.deleteShouldFail = true;
+
+    const error = await expectAppError(
+      () => fixture.service.logout(login.sessionId),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(error.status).toBe(503);
+
+    // Nothing was written, so the caller must not be told the logout worked.
+    expect(fixture.sessions.rows.get(login.sessionId)?.isRevoked).toBe(false);
+    expect(fixture.sessionStore.states.has(login.sessionId)).toBe(true);
+  });
+
+  it("succeeds when only one of the two revocation writes lands", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.sessions.markRevokedShouldFail = true;
+
+    await fixture.service.logout(login.sessionId);
+
+    // One write landed: the Redis/PostgreSQL cross-check fails closed on the
+    // next request, so a 2xx here is safe.
+    expect(fixture.sessions.rows.get(login.sessionId)?.isRevoked).toBe(false);
+    expect(fixture.sessionStore.states.has(login.sessionId)).toBe(false);
+  });
+});
+
+describe("AuthService constant-work login paths", () => {
+  it("runs a single KDF on the wrong-password path", async () => {
+    const fixture = seededFixture();
+
+    await expectAppError(
+      () => fixture.service.login({ ...LOGIN_PAYLOAD, password: "wrong" }),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+
+    // One real verification; no second dummy burn (timing must match the
+    // unknown-identifier path).
+    expect(fixture.hasher.verifyCalls).toBe(1);
+    expect(fixture.hasher.dummyCalls).toBe(0);
+  });
+
+  it("burns exactly one dummy KDF for an unknown identifier", async () => {
+    const fixture = createFakeAuthFixture();
+    seedInstitution(fixture);
+
+    await expectAppError(
+      () =>
+        fixture.service.login({
+          ...LOGIN_PAYLOAD,
+          identifier: "ghost@unilag.edu.ng",
+        }),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+
+    expect(fixture.hasher.verifyCalls).toBe(0);
+    expect(fixture.hasher.dummyCalls).toBe(1);
+  });
 });
 
 describe("AuthService.heartbeat", () => {
@@ -671,5 +734,241 @@ describe("AuthService.heartbeat", () => {
         fixture.service.heartbeat("44444444-4444-4444-8444-444444444444"),
       ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
     );
+  });
+});
+
+describe("AuthService verification slots", () => {
+  it("rejects login before the KDF when the verification cap is reached", async () => {
+    const fixture = seededFixture();
+    fixture.protection.maxConcurrentVerifications = 0;
+
+    const error = await expectAppError(
+      () => fixture.service.login(LOGIN_PAYLOAD),
+      ERROR_CODES.ACCOUNT_TEMPORARILY_LOCKED,
+    );
+
+    expect(error.status).toBe(429);
+    expect(error.message).toContain("in progress");
+    // Rejected before any account lookup: no failure recorded, no session.
+    expect(fixture.protection.failures).toHaveLength(0);
+    expect(fixture.protection.successes).toHaveLength(0);
+    expect(fixture.sessionStore.states.size).toBe(0);
+  });
+
+  it("fails closed with 503 when the slot cannot be acquired", async () => {
+    const fixture = seededFixture();
+    fixture.protection.acquireShouldFail = true;
+
+    const error = await expectAppError(
+      () => fixture.service.login(LOGIN_PAYLOAD),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(error.status).toBe(503);
+    expect(fixture.protection.failures).toHaveLength(0);
+  });
+
+  it("releases the slot after a successful login", async () => {
+    const fixture = seededFixture();
+
+    await fixture.service.login(LOGIN_PAYLOAD);
+
+    expect(fixture.protection.acquireCalls).toBe(1);
+    expect(fixture.protection.releaseCalls).toBe(1);
+  });
+
+  it("releases the slot after a rejected password", async () => {
+    const fixture = seededFixture();
+
+    await expectAppError(
+      () => fixture.service.login({ ...LOGIN_PAYLOAD, password: "wrong" }),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+
+    expect(fixture.protection.acquireCalls).toBe(1);
+    expect(fixture.protection.releaseCalls).toBe(1);
+  });
+
+  it("releases the slot when a post-acquire validation fails", async () => {
+    const fixture = seededFixture([
+      RoleCode.PROJECT_SUPERVISOR,
+      RoleCode.PROJECT_EXAMINER,
+    ]);
+
+    await expectAppError(
+      () => fixture.service.login(LOGIN_PAYLOAD),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+
+    expect(fixture.protection.acquireCalls).toBe(1);
+    expect(fixture.protection.releaseCalls).toBe(1);
+  });
+});
+
+describe("AuthService.resolveSession role/scope revalidation", () => {
+  it("revokes the session when the active role assignment is removed", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    const rowBefore = fixture.sessions.rows.get(login.sessionId);
+    expect(rowBefore).toBeDefined();
+    const lastActivityBefore = rowBefore?.lastActivityAt;
+
+    seedRoles(fixture, []);
+
+    await expectAppError(
+      () =>
+        fixture.service.resolveSession({
+          cookieSessionId: login.sessionId,
+          ip: "203.0.113.10",
+        }),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    );
+
+    const row = fixture.sessions.rows.get(login.sessionId);
+    expect(row?.isRevoked).toBe(true);
+    expect(row?.revokedReason).toBe("ROLE_REVOKED");
+    // Activity must not be refreshed for a session revoked mid-request.
+    expect(row?.lastActivityAt).toEqual(lastActivityBefore);
+    expect(fixture.sessionStore.states.has(login.sessionId)).toBe(false);
+  });
+
+  it("revokes the session when any previously held role is revoked", async () => {
+    const fixture = seededFixture([
+      RoleCode.PROJECT_SUPERVISOR,
+      RoleCode.PROJECT_EXAMINER,
+    ]);
+    const login = await fixture.service.login({
+      ...LOGIN_PAYLOAD,
+      activeRoleHeader: RoleCode.PROJECT_EXAMINER,
+    });
+
+    // The *other* role (not the active one) is revoked: FR-227 still applies.
+    seedRoles(fixture, [RoleCode.PROJECT_EXAMINER]);
+
+    await expectAppError(
+      () =>
+        fixture.service.resolveSession({
+          cookieSessionId: login.sessionId,
+          ip: "203.0.113.10",
+        }),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    );
+    expect(
+      fixture.sessions.rows.get(login.sessionId)?.revokedReason,
+    ).toBe("ROLE_REVOKED");
+  });
+
+  it("keeps the session when a role is granted after login", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+
+    seedRoles(fixture, [RoleCode.PROJECT_SUPERVISOR, RoleCode.PROJECT_EXAMINER]);
+
+    const context = await fixture.service.resolveSession({
+      cookieSessionId: login.sessionId,
+      ip: "203.0.113.10",
+    });
+
+    expect(context.activeRole).toBe(RoleCode.PROJECT_SUPERVISOR);
+    expect(fixture.sessions.rows.get(login.sessionId)?.isRevoked).toBe(false);
+  });
+
+  it("revokes a coordinator session when an appointment is revoked", async () => {
+    const fixture = seededFixture([RoleCode.PROJECT_COORDINATOR]);
+    const selected = coordinatorScope();
+    const other = coordinatorScope({
+      appointmentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    });
+    seedCoordinatorScopes(fixture, [selected, other]);
+    const login = await fixture.service.login({
+      ...LOGIN_PAYLOAD,
+      coordinatorAppointmentHeader: selected.appointmentId,
+    });
+
+    // Only the non-selected appointment remains active.
+    seedCoordinatorScopes(fixture, [other]);
+
+    await expectAppError(
+      () =>
+        fixture.service.resolveSession({
+          cookieSessionId: login.sessionId,
+          ip: "203.0.113.10",
+        }),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    );
+    expect(
+      fixture.sessions.rows.get(login.sessionId)?.revokedReason,
+    ).toBe("SCOPE_REVOKED");
+  });
+
+  it("keeps a coordinator session when an appointment is added", async () => {
+    const fixture = seededFixture([RoleCode.PROJECT_COORDINATOR]);
+    const scope = coordinatorScope();
+    seedCoordinatorScopes(fixture, [scope]);
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+
+    seedCoordinatorScopes(fixture, [
+      scope,
+      coordinatorScope({
+        appointmentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    ]);
+
+    const context = await fixture.service.resolveSession({
+      cookieSessionId: login.sessionId,
+      ip: "203.0.113.10",
+    });
+    expect(context.activeRole).toBe(RoleCode.PROJECT_COORDINATOR);
+    expect(
+      fixture.sessions.rows.get(login.sessionId)?.isRevoked,
+    ).toBe(false);
+  });
+
+  it("skips role revalidation for platform admins", async () => {
+    const fixture = createFakeAuthFixture();
+    fixture.users.users.push({
+      id: "99999999-9999-4999-8999-999999999999",
+      institutionId: null,
+      isPlatformAdmin: true,
+      fullName: "Platform Admin",
+      email: "admin@clario.app",
+      institutionalIdNumber: null,
+      accountStatus: "ACTIVE",
+      passwordHash: `fake-argon2id$${PASSWORD}`,
+      mfaRequired: true,
+      mfaEnrolled: true,
+    });
+    const login = await fixture.service.login({
+      identifier: "admin@clario.app",
+      password: PASSWORD,
+      ip: "198.51.100.7",
+    });
+
+    // No role rows exist for platform admins; the session must still resolve.
+    fixture.roles.findActiveRolesShouldFail = true;
+    const context = await fixture.service.resolveSession({
+      cookieSessionId: login.sessionId,
+      ip: "198.51.100.7",
+    });
+    expect(context.activeRole).toBe(RoleCode.PLATFORM_ADMIN);
+  });
+
+  it("fails with 503 without revoking when revalidation cannot run", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.roles.findActiveRolesShouldFail = true;
+
+    const error = await expectAppError(
+      () =>
+        fixture.service.resolveSession({
+          cookieSessionId: login.sessionId,
+          ip: "203.0.113.10",
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(error.status).toBe(503);
+
+    const row = fixture.sessions.rows.get(login.sessionId);
+    expect(row?.isRevoked).toBe(false);
+    expect(fixture.sessionStore.states.has(login.sessionId)).toBe(true);
   });
 });

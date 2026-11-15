@@ -111,7 +111,43 @@ export const EnvironmentSchema = z.object({
   LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: positiveMinutes.default(15),
   LOGIN_LOCKOUT_COOLDOWN_MULTIPLIER:
     z.coerce.number().min(1).default(2),
-  LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES: positiveMinutes.default(60)
+  LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES: positiveMinutes.default(60),
+
+  /**
+   * Upper bound on in-flight Argon2id verifications per client IP and per
+   * login identifier. Reservations are taken *before* the KDF runs so a burst
+   * of concurrent logins cannot exhaust backend memory (review finding P1).
+   */
+  LOGIN_MAX_CONCURRENT_VERIFICATIONS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(5),
+
+  /**
+   * Process-wide cap on in-flight Argon2id verifications. Bounds total memory
+   * even when a distributed attack uses many distinct IPs/identifiers.
+   */
+  LOGIN_MAX_CONCURRENT_VERIFICATIONS_GLOBAL: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(16)
+}).superRefine((data, ctx) => {
+  // `cooldownSecondsFor` computes min(base × multiplier^n, max); a base above
+  // the max would silently never apply, so reject the misconfiguration at
+  // startup instead.
+  if (
+    data.LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES <
+    data.LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES"],
+      message:
+        "must be >= LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES (the base cooldown would never apply otherwise)",
+    });
+  }
 });
 
 export type Environment = z.infer<
