@@ -9,9 +9,16 @@ import {
   resolveAuthConfig,
   type AuthConfig,
 } from "../../../modules/auth/auth.config.js";
+import { AccountService } from "../../../modules/auth/auth.account.service.js";
+import type { CompromisedPasswordChecker } from "../../../modules/auth/auth.password-policy.js";
 import type {
+  AccountRecord,
+  AccountRepository,
+  ActivateAccountInput,
+  ConsumePasswordResetInput,
   InstitutionRecord,
   InstitutionRepository,
+  IssuePasswordResetInput,
   LoginProtectionStore,
   LoginUserRecord,
   NewSessionRow,
@@ -25,6 +32,7 @@ import type {
   VerificationSlot,
 } from "../../../modules/auth/auth.ports.js";
 import { AuthService } from "../../../modules/auth/auth.service.js";
+import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
 import type { SessionState } from "../../../modules/auth/auth.types.js";
 
 export const testAuthConfig: AuthConfig = resolveAuthConfig(
@@ -140,6 +148,7 @@ export class FakeSessionRepository implements SessionRepository {
   rows = new Map<string, StoredSessionRow>();
   createShouldFail = false;
   markRevokedShouldFail = false;
+  revokeAllForUserShouldFail = false;
 
   async create(row: NewSessionRow): Promise<void> {
     if (this.createShouldFail) {
@@ -172,6 +181,21 @@ export class FakeSessionRepository implements SessionRepository {
     if (row !== undefined) {
       row.lastActivityAt = at;
     }
+  }
+
+  async revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]> {
+    if (this.revokeAllForUserShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    const revoked: UUID[] = [];
+    for (const row of this.rows.values()) {
+      if (row.userId === userId && !row.isRevoked) {
+        row.isRevoked = true;
+        row.revokedReason = reason;
+        revoked.push(row.id);
+      }
+    }
+    return revoked;
   }
 }
 
@@ -255,24 +279,167 @@ export class FakeProtectionStore implements LoginProtectionStore {
 
 export interface FakeAuthFixture {
   service: AuthService;
+  accountService: AccountService;
   hasher: FakePasswordHasher;
   users: FakeUserRepository;
+  accounts: FakeAccountRepository;
   institutions: FakeInstitutionRepository;
   roles: FakeRoleAssignmentRepository;
   sessions: FakeSessionRepository;
   sessionStore: FakeSessionStore;
   protection: FakeProtectionStore;
+  compromisedPasswords: FakeCompromisedPasswordChecker;
   config: AuthConfig;
+}
+
+/**
+ * Account record of the fake repository. It carries the password hash on
+ * top of the port record so tests can assert what was stored.
+ */
+export interface FakeAccountRecord extends AccountRecord {
+  passwordHash: string | null;
+}
+
+/**
+ * In-memory {@link AccountRepository}. The conditional-write semantics of
+ * the real adapter are reproduced faithfully: the single-use guarantees of
+ * the activation and password-reset tokens are enforced here, not only in
+ * PostgreSQL.
+ */
+export class FakeAccountRepository implements AccountRepository {
+  accounts: FakeAccountRecord[] = [];
+  /** Every password-reset issuance, including the raw token. */
+  issuedResets: IssuePasswordResetInput[] = [];
+
+  async findByInvitationTokenHash(
+    tokenHash: string,
+  ): Promise<AccountRecord | null> {
+    return (
+      this.accounts.find(
+        (account) => account.invitationTokenHash === tokenHash,
+      ) ?? null
+    );
+  }
+
+  async findByPasswordResetTokenHash(
+    tokenHash: string,
+  ): Promise<AccountRecord | null> {
+    return (
+      this.accounts.find(
+        (account) => account.passwordResetTokenHash === tokenHash,
+      ) ?? null
+    );
+  }
+
+  async findActiveByIdentifier(
+    identifier: string,
+    institutionId?: UUID,
+  ): Promise<AccountRecord | null> {
+    const needle = identifier.toLowerCase();
+    const matches = this.accounts.filter(
+      (account) =>
+        account.accountStatus === "ACTIVE" &&
+        (institutionId === undefined ||
+          account.institutionId === institutionId) &&
+        account.email.toLowerCase() === needle,
+    );
+
+    // More than one match is an ambiguous tenant and must be
+    // indistinguishable from "no account".
+    return matches.length === 1 ? (matches[0] as AccountRecord) : null;
+  }
+
+  async activateAccount(input: ActivateAccountInput): Promise<boolean> {
+    const account = this.accounts.find(
+      (candidate) => candidate.id === input.userId,
+    );
+    if (account === undefined) {
+      return false;
+    }
+    if (account.accountStatus !== "INVITED") {
+      return false;
+    }
+    if (account.invitationTokenHash !== input.invitationTokenHash) {
+      return false;
+    }
+    if (
+      account.invitationExpiresAt === null ||
+      account.invitationExpiresAt.getTime() <= input.now.getTime()
+    ) {
+      return false;
+    }
+
+    account.accountStatus = "ACTIVE";
+    account.passwordHash = input.passwordHash;
+    account.mfaRequired = input.mfaRequired;
+    account.invitationTokenHash = null;
+    account.invitationExpiresAt = null;
+    return true;
+  }
+
+  async issuePasswordReset(input: IssuePasswordResetInput): Promise<void> {
+    const account = this.accounts.find(
+      (candidate) => candidate.id === input.userId,
+    );
+    if (account === undefined) {
+      return;
+    }
+
+    account.passwordResetTokenHash = input.tokenHash;
+    account.passwordResetExpiresAt = input.expiresAt;
+    this.issuedResets.push(input);
+  }
+
+  async consumePasswordReset(
+    input: ConsumePasswordResetInput,
+  ): Promise<boolean> {
+    const account = this.accounts.find(
+      (candidate) => candidate.id === input.userId,
+    );
+    if (account === undefined) {
+      return false;
+    }
+    if (account.passwordResetTokenHash !== input.tokenHash) {
+      return false;
+    }
+    if (
+      account.passwordResetExpiresAt === null ||
+      account.passwordResetExpiresAt.getTime() <= input.now.getTime()
+    ) {
+      return false;
+    }
+
+    account.passwordHash = input.passwordHash;
+    account.passwordResetTokenHash = null;
+    account.passwordResetExpiresAt = null;
+    return true;
+  }
+}
+
+/**
+ * Compromised-password checker stub. The real screener is exercised by its
+ * own unit test; the fake only lets a test declare a password compromised.
+ */
+export class FakeCompromisedPasswordChecker implements CompromisedPasswordChecker {
+  compromised = new Set<string>();
+  checked: string[] = [];
+
+  async isCompromised(password: string): Promise<boolean> {
+    this.checked.push(password);
+    return this.compromised.has(password);
+  }
 }
 
 export function createFakeAuthFixture(): FakeAuthFixture {
   const hasher = new FakePasswordHasher();
   const users = new FakeUserRepository();
+  const accounts = new FakeAccountRepository();
   const institutions = new FakeInstitutionRepository();
   const roles = new FakeRoleAssignmentRepository();
   const sessions = new FakeSessionRepository();
   const sessionStore = new FakeSessionStore();
   const protection = new FakeProtectionStore();
+  const compromisedPasswords = new FakeCompromisedPasswordChecker();
 
   const service = new AuthService({
     config: testAuthConfig,
@@ -285,15 +452,29 @@ export function createFakeAuthFixture(): FakeAuthFixture {
     protection,
   });
 
+  const accountService = new AccountService({
+    config: testAuthConfig,
+    hasher,
+    accounts,
+    institutions,
+    roles,
+    sessions,
+    sessionStore,
+    compromisedPasswords,
+  });
+
   return {
     service,
+    accountService,
     hasher,
     users,
+    accounts,
     institutions,
     roles,
     sessions,
     sessionStore,
     protection,
+    compromisedPasswords,
     config: testAuthConfig,
   };
 }
@@ -389,3 +570,74 @@ export const LOGIN_PAYLOAD = {
   ip: "203.0.113.10",
   userAgent: "vitest",
 };
+
+/** Raw single-use tokens used by the account-lifecycle tests. */
+export const INVITATION_TOKEN = "invitation-token-for-tests";
+export const PASSWORD_RESET_TOKEN = "password-reset-token-for-tests";
+
+/**
+ * Seeds a runtime session state in the fake Redis store.
+ */
+export function seedSessionState(
+  fixture: FakeAuthFixture,
+  sessionId: UUID,
+  overrides: Partial<SessionState> = {},
+): SessionState {
+  const state: SessionState = {
+    sessionId,
+    userId: USER_ID,
+    fullName: "Dr. Tunde Adewale",
+    email: "tunde.adewale@unilag.edu.ng",
+    institutionalIdNumber: "UNILAG/STAFF/0042",
+    institutionId: INSTITUTION_ID,
+    institutionName: "University of Lagos",
+    institutionCode: "UNILAG",
+    institutionTimezone: "Africa/Lagos",
+    subscriptionStatus: null,
+    gracePeriodEndsAtUtc: null,
+    assignedRoles: [RoleCode.STUDENT],
+    activeRole: RoleCode.STUDENT,
+    mfaRequired: false,
+    mfaEnrolled: false,
+    mfaVerified: false,
+    coordinatorAppointments: [],
+    activeCoordinatorScope: null,
+    inactivityTimeoutMinutes: 60,
+    createdAtUtc: new Date().toISOString(),
+    expiresAtUtc: new Date(Date.now() + 60 * 60_000).toISOString(),
+    lastActivityAtUtc: new Date().toISOString(),
+    ...overrides,
+  };
+
+  fixture.sessionStore.states.set(state.sessionId, state);
+  fixture.sessionStore.ttls.set(state.sessionId, 60 * 60);
+  return state;
+}
+
+/**
+ * Seeds an account for the account-lifecycle flows. The default is an
+ * *invited* account with a live invitation token — the state an account
+ * holds between the invitation and the activation.
+ */
+export function seedAccount(
+  fixture: FakeAuthFixture,
+  overrides: Partial<FakeAccountRecord> = {},
+): FakeAccountRecord {
+  const account: FakeAccountRecord = {
+    id: USER_ID,
+    institutionId: INSTITUTION_ID,
+    isPlatformAdmin: false,
+    fullName: "Dr. Tunde Adewale",
+    email: "tunde.adewale@unilag.edu.ng",
+    accountStatus: "INVITED",
+    mfaRequired: false,
+    invitationTokenHash: hashSingleUseToken(INVITATION_TOKEN),
+    invitationExpiresAt: new Date(Date.now() + 24 * 60 * 60_000),
+    passwordResetTokenHash: null,
+    passwordResetExpiresAt: null,
+    passwordHash: null,
+    ...overrides,
+  };
+  fixture.accounts.accounts.push(account);
+  return account;
+}

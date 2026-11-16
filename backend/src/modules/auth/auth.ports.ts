@@ -97,6 +97,12 @@ export interface SessionRepository {
   findById(sessionId: UUID): Promise<SessionRecord | null>;
   markRevoked(sessionId: UUID, reason: string): Promise<void>;
   touchActivity(sessionId: UUID, at: Date): Promise<void>;
+  /**
+   * Revokes every non-revoked session of an account and returns the ids of
+   * the sessions it revoked, so the caller can also drop the matching
+   * runtime state (F-64 password reset revokes *all* sessions).
+   */
+  revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]>;
 }
 
 export interface SessionStore {
@@ -137,4 +143,98 @@ export interface LoginProtectionStore {
     input: { ip: string; identifier: string },
     slot: VerificationSlot,
   ): Promise<void>;
+}
+
+/**
+ * An account as seen by the account-lifecycle flows (activation, password
+ * reset). Deliberately narrower than {@link LoginUserRecord}: it carries the
+ * single-use token digests and their expiry, and nothing about a live login.
+ */
+export interface AccountRecord {
+  id: UUID;
+  institutionId: UUID | null;
+  isPlatformAdmin: boolean;
+  fullName: string;
+  email: string;
+  accountStatus: string;
+  mfaRequired: boolean;
+  invitationTokenHash: string | null;
+  invitationExpiresAt: Date | null;
+  passwordResetTokenHash: string | null;
+  passwordResetExpiresAt: Date | null;
+}
+
+export interface ActivateAccountInput {
+  userId: UUID;
+  /** Digest of the invitation token that was presented. */
+  invitationTokenHash: string;
+  passwordHash: string;
+  mfaRequired: boolean;
+  now: Date;
+}
+
+export interface IssuePasswordResetInput {
+  userId: UUID;
+  institutionId: UUID | null;
+  /** Digest of the freshly generated reset token. */
+  tokenHash: string;
+  /** The raw token, handed to the transactional email (F-71). */
+  rawToken: string;
+  email: string;
+  fullName: string;
+  expiresAt: Date;
+  now: Date;
+}
+
+export interface ConsumePasswordResetInput {
+  userId: UUID;
+  /** Digest of the reset token that was presented. */
+  tokenHash: string;
+  passwordHash: string;
+  now: Date;
+}
+
+/**
+ * Persistence of the account-lifecycle state (F-64).
+ *
+ * The token-consuming methods are deliberately *conditional writes*: they
+ * only apply when the account is still in the expected state and the
+ * presented token digest still matches. That makes "an invited account can
+ * be activated only once" and "a reset token can be used only once"
+ * database-enforced invariants rather than application-level races.
+ */
+export interface AccountRepository {
+  findByInvitationTokenHash(
+    tokenHash: string,
+  ): Promise<AccountRecord | null>;
+  findByPasswordResetTokenHash(
+    tokenHash: string,
+  ): Promise<AccountRecord | null>;
+  /**
+   * Finds the single active account matching an identifier (email or
+   * institutional ID). Returns `null` when no account matches, when more
+   * than one matches (ambiguous tenant), or when the matched account is not
+   * active — the caller must not be able to tell those cases apart.
+   */
+  findActiveByIdentifier(
+    identifier: string,
+    institutionId?: UUID,
+  ): Promise<AccountRecord | null>;
+  /**
+   * Activates an invited account. Returns `false` when the account is no
+   * longer `INVITED`, the token no longer matches or the invitation has
+   * expired — in every case nothing was written.
+   */
+  activateAccount(input: ActivateAccountInput): Promise<boolean>;
+  /**
+   * Stores the reset token and records the transactional-email request in
+   * the same transaction, so a stored token always has a delivery request
+   * (and never the other way round).
+   */
+  issuePasswordReset(input: IssuePasswordResetInput): Promise<void>;
+  /**
+   * Applies the new password and clears the reset token in one conditional
+   * write. Returns `false` when the token was already consumed or expired.
+   */
+  consumePasswordReset(input: ConsumePasswordResetInput): Promise<boolean>;
 }

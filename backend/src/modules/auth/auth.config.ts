@@ -31,6 +31,8 @@ export interface AuthConfig {
   absoluteLifetimeMinutes: number;
   inactivityTimeoutMinutesByRole: Readonly<Record<RoleCode, number>>;
   protection: LoginProtectionConfig;
+  /** Lifetime of the single-use self-service password-reset token. */
+  passwordResetTokenTtlMinutes: number;
 }
 
 function inactivityTimeouts(env: Environment): Record<RoleCode, number> {
@@ -68,6 +70,7 @@ export function resolveAuthConfig(env: Environment): AuthConfig {
       maxConcurrentVerificationsGlobal:
         env.LOGIN_MAX_CONCURRENT_VERIFICATIONS_GLOBAL,
     }),
+    passwordResetTokenTtlMinutes: env.PASSWORD_RESET_TOKEN_TTL_MINUTES,
   });
 }
 

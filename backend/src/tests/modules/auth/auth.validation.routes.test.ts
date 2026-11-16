@@ -20,7 +20,10 @@ function buildApp(fixture: FakeAuthFixture): ReturnType<typeof express> {
 
   app.use(requestContextMiddleware);
   app.use(express.json());
-  app.use("/api/v1/auth", createAuthRouter(fixture.service, fixture.config));
+  app.use(
+    "/api/v1/auth",
+    createAuthRouter(fixture.service, fixture.accountService, fixture.config),
+  );
   app.use(errorHandler);
 
   return app;

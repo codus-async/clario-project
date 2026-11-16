@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type Request, type Response } from "express";
 import request from "supertest";
 import { RoleCode } from "@clario/shared-contracts";
 import { describe, expect, it } from "vitest";
@@ -10,9 +10,14 @@ import {
   createRequireSession,
 } from "../../../modules/auth/auth.middleware.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
+import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
 import {
+  INVITATION_TOKEN,
   LOGIN_BODY,
+  PASSWORD,
+  PASSWORD_RESET_TOKEN,
   createFakeAuthFixture,
+  seedAccount,
   seedInstitution,
   seedRoles,
   seedTenantUser,
@@ -24,7 +29,10 @@ function buildApp(fixture: FakeAuthFixture): ReturnType<typeof express> {
 
   app.use(requestContextMiddleware);
   app.use(express.json());
-  app.use("/api/v1/auth", createAuthRouter(fixture.service, fixture.config));
+  app.use(
+    "/api/v1/auth",
+    createAuthRouter(fixture.service, fixture.accountService, fixture.config),
+  );
 
   const requireSession = createRequireSession(fixture.service);
 
@@ -38,8 +46,8 @@ function buildApp(fixture: FakeAuthFixture): ReturnType<typeof express> {
   app.get(
     "/admin-only",
     requireSession,
-    createRequireMfaVerified,
-    (_req, res) => {
+    createRequireMfaVerified(fixture.service),
+    (_req: Request, res: Response) => {
       res.status(200).json({ ok: true });
     },
   );
@@ -125,6 +133,7 @@ describe("POST /api/v1/auth/login", () => {
     expect(response.body.mfa_required).toBe(false);
     expect(response.body.mfa_enrolled).toBe(false);
     expect(response.body.mfa_verified).toBe(false);
+    expect(response.body.next_step).toBeNull();
     expect(response.body.inactivity_timeout_minutes).toBe(60);
 
     const setCookie = setCookieHeaders(response);
@@ -212,6 +221,18 @@ describe("POST /api/v1/auth/login", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.active_role).toBe(RoleCode.PROJECT_EXAMINER);
+  });
+
+  it("reports the MFA challenge as the next step for a mandatory-MFA role", async () => {
+    const app = buildApp(seededFixture([RoleCode.INSTITUTIONAL_ADMIN]));
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send(LOGIN_BODY);
+
+    expect(response.status).toBe(200);
+    expect(response.body.mfa_required).toBe(true);
+    expect(response.body.next_step).toBe("MFA_CHALLENGE_REQUIRED");
   });
 });
 
@@ -440,5 +461,171 @@ describe("createRequireMfaVerified", () => {
 
     expect(response.status).toBe(403);
     expect(response.body.error.code).toBe("MFA_CHALLENGE_REQUIRED");
+  });
+});
+
+describe("POST /api/v1/auth/activate", () => {
+  it("activates an invited account", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture);
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: INVITATION_TOKEN, password: PASSWORD });
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.account_status).toBe("ACTIVE");
+    expect(fixture.accounts.accounts[0]?.accountStatus).toBe("ACTIVE");
+  });
+
+  it("rejects an unknown activation token", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture);
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: "not-a-real-token", password: PASSWORD });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("token");
+    expect(fixture.accounts.accounts[0]?.accountStatus).toBe("INVITED");
+  });
+
+  it("rejects a password below the SEC-02 minimum", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture);
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: INVITATION_TOKEN, password: "Short1!" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("password");
+  });
+
+  it("rejects a compromised password", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture);
+    fixture.compromisedPasswords.compromised.add("Password1234!");
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: INVITATION_TOKEN, password: "Password1234!" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("COMPROMISED_OR_WEAK_PASSWORD");
+    expect(fixture.accounts.accounts[0]?.accountStatus).toBe("INVITED");
+  });
+
+  it("rejects an activation token that was already used", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture);
+    const app = buildApp(fixture);
+
+    const first = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: INVITATION_TOKEN, password: PASSWORD });
+    expect(first.status).toBe(200);
+
+    const second = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token: INVITATION_TOKEN, password: PASSWORD });
+
+    expect(second.status).toBe(400);
+    expect(second.body.error.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+describe("POST /api/v1/auth/password/forgot", () => {
+  it("acknowledges a reset request without revealing whether the account exists", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture, {
+      accountStatus: "ACTIVE",
+      passwordHash: `fake-argon2id$${PASSWORD}`,
+    });
+    const app = buildApp(fixture);
+
+    const known = await request(app)
+      .post("/api/v1/auth/password/forgot")
+      .send({ identifier: "tunde.adewale@unilag.edu.ng" });
+    const unknown = await request(app)
+      .post("/api/v1/auth/password/forgot")
+      .send({ identifier: "nobody@unilag.edu.ng" });
+
+    expect(known.status).toBe(202);
+    expect(unknown.status).toBe(202);
+    // Identical bodies: the endpoint is not an enumeration oracle.
+    expect(known.body).toEqual(unknown.body);
+    // Only the real account received a token.
+    expect(fixture.accounts.issuedResets).toHaveLength(1);
+  });
+
+  it("rejects a request without an identifier", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/password/forgot")
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("identifier");
+  });
+});
+
+describe("POST /api/v1/auth/password/reset", () => {
+  it("changes the password and revokes every session of the account", async () => {
+    const fixture = seededFixture();
+    seedAccount(fixture, {
+      accountStatus: "ACTIVE",
+      passwordHash: `fake-argon2id$${PASSWORD}`,
+      passwordResetTokenHash: hashSingleUseToken(PASSWORD_RESET_TOKEN),
+      passwordResetExpiresAt: new Date(Date.now() + 30 * 60_000),
+    });
+    const app = buildApp(fixture);
+    const { sessionId } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/password/reset")
+      .send({ token: PASSWORD_RESET_TOKEN, password: "Brand-New-Strong-Pass-77!" });
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(fixture.accounts.accounts[0]?.passwordHash).toBe(
+      "fake-argon2id$Brand-New-Strong-Pass-77!",
+    );
+    expect(fixture.sessions.rows.get(sessionId)?.isRevoked).toBe(true);
+    expect(fixture.sessionStore.states.has(sessionId)).toBe(false);
+  });
+
+  it("rejects an unknown reset token", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/password/reset")
+      .send({ token: "not-a-real-token", password: PASSWORD });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("token");
+  });
+
+  it("rejects a password below the SEC-02 minimum", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/password/reset")
+      .send({ token: PASSWORD_RESET_TOKEN, password: "Short1!" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("password");
   });
 });

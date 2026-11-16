@@ -459,6 +459,29 @@ export class AuthService {
   // -------------------------------------------------------------------------
 
   /**
+   * SEC-06 / FR-048 / AC-F64-02: an account that must enrol in MFA — or an
+   * account whose *active role* is one of the `MANDATORY_MFA_ROLES`
+   * (Platform Admin, Institutional Admin, Project Coordinator) — has no
+   * full access until the MFA challenge has been completed.
+   *
+   * The rule lives in the application service (not in the middleware) so it
+   * is part of the F-64 business logic and can be asserted directly in
+   * unit tests. `createRequireMfaVerified` is the thin HTTP adapter.
+   */
+  assertMfaSatisfied(context: AuthSessionContext): void {
+    const mfaMandatory =
+      context.mfaRequired ||
+      MANDATORY_MFA_ROLES.includes(context.activeRole);
+
+    if (mfaMandatory && !context.mfaVerified) {
+      throw new AppError(
+        ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+        "MFA verification is required before this action can be performed.",
+      );
+    }
+  }
+
+  /**
    * Resolves the session behind `cookie` / `Authorization: Bearer`
    * credentials, enforces absolute and inactivity expiry, cross-checks the
    * Redis state against the authoritative `user_sessions` row, re-checks

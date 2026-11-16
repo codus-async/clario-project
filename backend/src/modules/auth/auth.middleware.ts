@@ -1,4 +1,3 @@
-import { MANDATORY_MFA_ROLES } from "@clario/shared-contracts";
 import { parse as parseCookie } from "cookie";
 import type { RequestHandler } from "express";
 
@@ -76,32 +75,32 @@ export function createRequireSession(
  * `MANDATORY_MFA_ROLES`. Checking both matters because `mfaRequired` in the
  * session context can be true for an active role that is *not* on the
  * mandatory list (e.g. the account previously held an admin role).
+ *
+ * The rule itself lives in `AuthService.assertMfaSatisfied`; this middleware
+ * only adapts it to the request/response cycle.
  */
-export const createRequireMfaVerified: RequestHandler = (req, _res, next) => {
-  const context = req.authContext;
-  if (context === undefined) {
-    next(
-      new AppError(
-        ERROR_CODES.UNAUTHENTICATED,
-        "Authentication credentials were not provided.",
-      ),
-    );
-    return;
-  }
+export function createRequireMfaVerified(
+  authService: AuthService,
+): RequestHandler {
+  return (req, _res, next) => {
+    const context = req.authContext;
+    if (context === undefined) {
+      next(
+        new AppError(
+          ERROR_CODES.UNAUTHENTICATED,
+          "Authentication credentials were not provided.",
+        ),
+      );
+      return;
+    }
 
-  if (
-    (context.mfaRequired ||
-      MANDATORY_MFA_ROLES.includes(context.activeRole)) &&
-    !context.mfaVerified
-  ) {
-    next(
-      new AppError(
-        ERROR_CODES.MFA_CHALLENGE_REQUIRED,
-        "MFA verification is required before this action can be performed.",
-      ),
-    );
-    return;
-  }
+    try {
+      authService.assertMfaSatisfied(context);
+    } catch (error) {
+      next(error);
+      return;
+    }
 
-  next();
-};
+    next();
+  };
+}

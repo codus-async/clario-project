@@ -9,8 +9,14 @@ import {
   type AuthConfig,
 } from "./auth.config.js";
 import type { AuthService } from "./auth.service.js";
+import type { AccountService } from "./auth.account.service.js";
 import type { LoginResult } from "./auth.types.js";
-import type { LoginRequestBody } from "./auth.schemas.js";
+import type {
+  ActivateRequestBody,
+  LoginRequestBody,
+  PasswordResetBody,
+  PasswordResetRequestBody,
+} from "./auth.schemas.js";
 import { getValidatedBody } from "./auth.validation.js";
 
 /**
@@ -20,6 +26,7 @@ import { getValidatedBody } from "./auth.validation.js";
  */
 function loginResponse(result: LoginResult): Record<string, unknown> {
   const { state } = result;
+  const mfaPending = state.mfaRequired && !state.mfaVerified;
   return {
     session_id: state.sessionId,
     user: {
@@ -34,6 +41,12 @@ function loginResponse(result: LoginResult): Record<string, unknown> {
     mfa_required: state.mfaRequired,
     mfa_enrolled: state.mfaEnrolled,
     mfa_verified: state.mfaVerified,
+    /**
+     * Tells the client what it has to do next. `MFA_CHALLENGE_REQUIRED`
+     * means the session exists but has no full access until the MFA
+     * challenge is completed (SEC-06); `null` means the session is ready.
+     */
+    next_step: mfaPending ? "MFA_CHALLENGE_REQUIRED" : null,
     inactivity_timeout_minutes: state.inactivityTimeoutMinutes,
     expires_at_utc: state.expiresAtUtc,
   };
@@ -41,6 +54,7 @@ function loginResponse(result: LoginResult): Record<string, unknown> {
 
 export interface AuthControllerDeps {
   authService: AuthService;
+  accountService: AccountService;
   config: AuthConfig;
 }
 
@@ -48,8 +62,11 @@ export function createAuthController(deps: AuthControllerDeps): {
   login: RequestHandler;
   logout: RequestHandler;
   heartbeat: RequestHandler;
+  activate: RequestHandler;
+  requestPasswordReset: RequestHandler;
+  resetPassword: RequestHandler;
 } {
-  const { authService, config } = deps;
+  const { authService, accountService, config } = deps;
   const cookieMaxAgeMs = config.absoluteLifetimeMinutes * 60_000;
 
   const login: RequestHandler = async (req, res) => {
@@ -112,5 +129,59 @@ export function createAuthController(deps: AuthControllerDeps): {
     });
   };
 
-  return { login, logout, heartbeat };
+  const activate: RequestHandler = async (req, res) => {
+    const body = getValidatedBody<ActivateRequestBody>(req);
+
+    const result = await accountService.activate({
+      token: body.token,
+      password: body.password,
+    });
+
+    res.status(200).json({
+      success: true,
+      user_id: result.userId,
+      account_status: result.accountStatus,
+      mfa_required: result.mfaRequired,
+      mfa_enrolled: result.mfaEnrolled,
+    });
+  };
+
+  const requestPasswordReset: RequestHandler = async (req, res) => {
+    const body = getValidatedBody<PasswordResetRequestBody>(req);
+
+    await accountService.requestPasswordReset({
+      identifier: body.identifier,
+      institutionCode: body.institutionCode,
+    });
+
+    /**
+     * The response is identical whether or not an account matched: the
+     * endpoint must not be usable to enumerate accounts (SEC-04).
+     */
+    res.status(202).json({
+      success: true,
+      message:
+        "If the identifier matches an active account, a password reset link has been sent.",
+    });
+  };
+
+  const resetPassword: RequestHandler = async (req, res) => {
+    const body = getValidatedBody<PasswordResetBody>(req);
+
+    await accountService.resetPassword({
+      token: body.token,
+      password: body.password,
+    });
+
+    res.status(200).json({ success: true });
+  };
+
+  return {
+    login,
+    logout,
+    heartbeat,
+    activate,
+    requestPasswordReset,
+    resetPassword,
+  };
 }

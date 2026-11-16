@@ -106,6 +106,9 @@ export const EnvironmentSchema = z.object({
   SESSION_INACTIVITY_TIMEOUT_MINUTES_STUDENT:
     positiveMinutes.default(60),
 
+  /** Lifetime of the single-use self-service password-reset token. */
+  PASSWORD_RESET_TOKEN_TTL_MINUTES: positiveMinutes.default(30),
+
   LOGIN_MAX_FAILED_ATTEMPTS: z.coerce.number().int().positive().default(5),
   LOGIN_FAILURE_WINDOW_MINUTES: positiveMinutes.default(15),
   LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: positiveMinutes.default(15),
