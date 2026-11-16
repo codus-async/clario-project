@@ -49,6 +49,15 @@ export interface UserRepository {
     institutionCode?: string,
   ): Promise<LoginUserRecord[]>;
   findById(userId: UUID): Promise<LoginUserRecord | null>;
+  /**
+   * Records the "last authenticated" timestamp of an account (F-64 §G).
+   *
+   * The write is best-effort by contract: a failed write must never turn a
+   * successful authentication into an error, so the caller logs and carries
+   * on. `users` is not RLS protected (it is addressed by the opaque session
+   * id), so this goes through the plain Prisma client.
+   */
+  recordLogin(userId: UUID, at: Date): Promise<void>;
 }
 
 export interface InstitutionRepository {
@@ -74,7 +83,11 @@ export interface NewSessionRow {
   ipAddress: string | null;
   userAgent: string | null;
   inactivityTimeoutMinutes: number;
+  /** Creation timestamp of the session (audit metadata). */
+  createdAt: Date;
+  /** Last activity (heartbeat) timestamp of the session. */
   lastActivityAt: Date;
+  /** Absolute expiry timestamp of the session. */
   expiresAt: Date;
 }
 

@@ -388,6 +388,7 @@ export class AuthService {
         ipAddress: normalizeIpAddress(input.ip),
         userAgent: normalizeUserAgent(input.userAgent),
         inactivityTimeoutMinutes,
+        createdAt: new Date(now),
         lastActivityAt: new Date(now),
         expiresAt,
       });
@@ -415,6 +416,12 @@ export class AuthService {
         "The session could not be established. Please try again.",
       );
     }
+
+    // F-64 §G "Last Authenticated Timestamp": only recorded once the session
+    // is fully established, so a failed session write never leaves a
+    // "successful" login behind. The write is best-effort — the session is
+    // already valid and must not be invalidated by a bookkeeping failure.
+    await this.recordLastAuthenticatedAt(user.id, new Date(now));
 
     return { sessionId, state };
   }
@@ -833,6 +840,25 @@ export class AuthService {
       baseLogger.warn(
         { err: error, module: "auth" },
         "Failed to reset login protection counters",
+      );
+    }
+  }
+
+  /**
+   * F-64 §G "Last Authenticated Timestamp". Never fails the login: the
+   * session is already established and a missing timestamp is a bookkeeping
+   * problem, not an authentication failure.
+   */
+  private async recordLastAuthenticatedAt(
+    userId: UUID,
+    at: Date,
+  ): Promise<void> {
+    try {
+      await this.users.recordLogin(userId, at);
+    } catch (error) {
+      baseLogger.warn(
+        { err: error, module: "auth" },
+        "Failed to record the last authenticated timestamp",
       );
     }
   }

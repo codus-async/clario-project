@@ -1,3 +1,7 @@
+import {
+  CLARIO_HTTP_HEADERS,
+  PROBLEM_DETAILS_CONTENT_TYPE,
+} from "@clario/shared-contracts";
 import type { ErrorRequestHandler } from "express";
 
 import { AppError } from "../errors/app-error.js";
@@ -52,7 +56,7 @@ export const errorHandler: ErrorRequestHandler = (
   const timestamp = new Date().toISOString();
 
   const institutionTimezone =
-    res.getHeader("X-Clario-Institution-Timezone")?.toString() ??
+    res.getHeader(CLARIO_HTTP_HEADERS.INSTITUTION_TIMEZONE)?.toString() ??
     env.APP_TIMEZONE;
 
   if (error instanceof AppError) {
@@ -71,7 +75,10 @@ export const errorHandler: ErrorRequestHandler = (
       },
     };
 
-    res.status(error.status).json(response);
+    res
+      .status(error.status)
+      .type(PROBLEM_DETAILS_CONTENT_TYPE)
+      .json(response);
     return;
   }
 
@@ -88,7 +95,10 @@ export const errorHandler: ErrorRequestHandler = (
         institution_timezone: institutionTimezone,
       },
     };
-    res.status(parserError.status).json(parserResponse);
+    res
+      .status(parserError.status)
+      .type(PROBLEM_DETAILS_CONTENT_TYPE)
+      .json(parserResponse);
     return;
   }
 
@@ -117,5 +127,5 @@ export const errorHandler: ErrorRequestHandler = (
     },
   };
 
-  res.status(500).json(response);
+  res.status(500).type(PROBLEM_DETAILS_CONTENT_TYPE).json(response);
 };

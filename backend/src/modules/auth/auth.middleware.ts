@@ -1,4 +1,5 @@
 import { parse as parseCookie } from "cookie";
+import { CLARIO_HTTP_HEADERS } from "@clario/shared-contracts";
 import type { RequestHandler } from "express";
 
 import { AppError } from "../../errors/app-error.js";
@@ -53,7 +54,7 @@ function readBearerSession(authorization: string | undefined): string | undefine
 export function createRequireSession(
   authService: AuthService,
 ): RequestHandler {
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     try {
       const context = await authService.resolveSession({
         cookieSessionId: readSessionCookie(req.headers.cookie),
@@ -61,6 +62,12 @@ export function createRequireSession(
         ip: req.ip ?? "",
       });
       req.authContext = context;
+      // The tenant is known now: return its authoritative timezone instead of
+      // the platform default (REST contract §1.1, BR-NEW-01).
+      res.setHeader(
+        CLARIO_HTTP_HEADERS.INSTITUTION_TIMEZONE,
+        context.institutionTimezone,
+      );
       next();
     } catch (error) {
       next(error);

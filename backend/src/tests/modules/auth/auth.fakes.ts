@@ -67,6 +67,9 @@ export class FakePasswordHasher implements PasswordHasher {
 
 export class FakeUserRepository implements UserRepository {
   users: LoginUserRecord[] = [];
+  /** Last authenticated timestamps, keyed by user id. */
+  lastLoginAt = new Map<string, Date>();
+  recordLoginShouldFail = false;
 
   async findLoginCandidates(
     identifier: string,
@@ -85,6 +88,13 @@ export class FakeUserRepository implements UserRepository {
 
   async findById(userId: UUID): Promise<LoginUserRecord | null> {
     return this.users.find((user) => user.id === userId) ?? null;
+  }
+
+  async recordLogin(userId: UUID, at: Date): Promise<void> {
+    if (this.recordLoginShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    this.lastLoginAt.set(userId, at);
   }
 }
 

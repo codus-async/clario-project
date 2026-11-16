@@ -16,8 +16,10 @@ import {
   LOGIN_BODY,
   PASSWORD,
   PASSWORD_RESET_TOKEN,
+  coordinatorScope,
   createFakeAuthFixture,
   seedAccount,
+  seedCoordinatorScopes,
   seedInstitution,
   seedRoles,
   seedTenantUser,
@@ -142,6 +144,64 @@ describe("POST /api/v1/auth/login", () => {
     expect(setCookie[0]).toContain("Secure");
     expect(setCookie[0]).toContain("SameSite=Lax");
     expect(setCookie[0]).toContain("Path=/");
+  });
+
+  it("returns the institution timezone header", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send(LOGIN_BODY);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["x-clario-institution-timezone"]).toBe(
+      "Africa/Lagos",
+    );
+  });
+
+  it("returns an empty coordinator appointment list for a non-coordinator", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send(LOGIN_BODY);
+
+    expect(response.status).toBe(200);
+    expect(response.body.user.coordinator_appointments).toEqual([]);
+  });
+
+  it("returns the coordinator appointments of the account", async () => {
+    const fixture = seededFixture([RoleCode.PROJECT_COORDINATOR]);
+    seedCoordinatorScopes(fixture, [coordinatorScope()]);
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send(LOGIN_BODY);
+
+    expect(response.status).toBe(200);
+    expect(response.body.user.coordinator_appointments).toEqual([
+      {
+        appointment_id: "33333333-3333-4333-8333-333333333333",
+        programme_id: "44444444-4444-4444-8444-444444444444",
+        programme_name: "B.Sc. Computer Science",
+        academic_session_id: "66666666-6666-4666-8666-666666666666",
+        session_label: "2026/2027",
+      },
+    ]);
+  });
+
+  it("records the last authenticated timestamp of the account", async () => {
+    const fixture = seededFixture();
+    const app = buildApp(fixture);
+
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .send(LOGIN_BODY);
+
+    expect(response.status).toBe(200);
+    expect(fixture.users.lastLoginAt.get("22222222-2222-4222-8222-222222222222"))
+      .toBeInstanceOf(Date);
   });
 
   it("rejects a missing identifier with a validation error", async () => {
@@ -334,6 +394,21 @@ describe("session middleware", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.activeRole).toBe(RoleCode.PROJECT_SUPERVISOR);
+  });
+
+  it("returns the institution timezone header on an authenticated route", async () => {
+    const fixture = seededFixture();
+    const app = buildApp(fixture);
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+
+    expect(response.status).toBe(200);
+    expect(response.headers["x-clario-institution-timezone"]).toBe(
+      "Africa/Lagos",
+    );
   });
 
   it("authenticates a protected route with a bearer token", async () => {

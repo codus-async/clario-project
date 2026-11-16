@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 
 import { env } from "./config/env.js";
+import { institutionTimezoneMiddleware } from "./middleware/institution-timezone.middleware.js";
 import { requestContextMiddleware } from "./middleware/request-context.middleware.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { healthRouter } from "./modules/health/health.routes.js";
@@ -15,6 +16,7 @@ export function createApp(): Express {
   app.set("trust proxy", env.TRUST_PROXY_HOPS);
 
   app.use(requestContextMiddleware);
+  app.use(institutionTimezoneMiddleware);
   app.use(express.json({ limit: "1mb" }));
 
   app.use("/health", healthRouter);

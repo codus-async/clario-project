@@ -26,6 +26,15 @@ function buildApp(): express.Express {
 }
 
 describe("errorHandler", () => {
+  it("returns the RFC 9457 problem details media type", async () => {
+    const response = await request(buildApp()).get("/app-error");
+
+    expect(response.status).toBe(503);
+    expect(response.headers["content-type"]).toContain(
+      "application/problem+json",
+    );
+  });
+
   it("returns the documented error structure for an AppError", async () => {
     const response = await request(buildApp()).get("/app-error");
 

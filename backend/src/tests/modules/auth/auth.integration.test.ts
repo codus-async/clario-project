@@ -93,6 +93,8 @@ let app: ReturnType<typeof express>;
 let institutionId: string;
 let supervisorId: string;
 let coordinatorId: string;
+let programmeId: string;
+let academicSessionId: string;
 let appointmentId: string;
 let supervisorPasswordHash: string;
 let countingHasher: CountingPasswordHasher;
@@ -170,14 +172,14 @@ beforeAll(async () => {
      VALUES ($1, $2, $3, 'B.Sc. Computer Science', 'CSC') RETURNING id`,
     [institutionId, facultyId, departmentId],
   );
-  const programmeId = firstRow(programmes.rows).id;
+  programmeId = firstRow(programmes.rows).id;
 
   const academicSessions = await sql.query<{ id: string }>(
     `INSERT INTO academic_sessions (institution_id, session_label, start_date, end_date)
      VALUES ($1, '2026/2027', '2026-09-01', '2027-08-31') RETURNING id`,
     [institutionId],
   );
-  const academicSessionId = firstRow(academicSessions.rows).id;
+  academicSessionId = firstRow(academicSessions.rows).id;
 
   const supervisor = await sql.query<{ id: string }>(
     `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
@@ -292,7 +294,116 @@ function cookieFrom(response: request.Response): string {
   return headers[0]?.split(";")[0] ?? "";
 }
 
+/**
+ * Rewrites the stored runtime session state, keeping its TTL. It simulates the
+ * passage of time without waiting for it: the expiry tests move the absolute
+ * deadline or the last-activity timestamp into the past.
+ */
+async function patchRedisSession(
+  sessionId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const key = `clario:session:${sessionId}`;
+  const raw = await redis.get(key);
+  expect(raw).not.toBeNull();
+  const state = JSON.parse(String(raw)) as Record<string, unknown>;
+  const ttl = await redis.ttl(key);
+  await redis.set(
+    key,
+    JSON.stringify({ ...state, ...patch }),
+    "EX",
+    Math.max(1, ttl),
+  );
+}
+
+/**
+ * The fields the REST contract (§2.1) requires on a login response. The
+ * implementation returns a few additional convenience fields
+ * (`active_role`, `expires_at_utc`), so the contract is asserted as a
+ * superset rather than an exact key set.
+ */
+const DOCUMENTED_LOGIN_FIELDS = [
+  "session_id",
+  "user",
+  "mfa_required",
+  "mfa_enrolled",
+  "mfa_verified",
+  "next_step",
+  "inactivity_timeout_minutes",
+];
+
+const DOCUMENTED_LOGIN_USER_FIELDS = [
+  "id",
+  "full_name",
+  "institution_id",
+  "institution_code",
+  "timezone_iana",
+  "roles",
+  "coordinator_appointments",
+];
+
 describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
+  it("records the last authenticated timestamp of the account", async () => {
+    const before = await db.users.findUnique({ where: { id: supervisorId } });
+    expect(before?.last_login_at).toBeNull();
+
+    const response = await login(SUPERVISOR_EMAIL);
+    expect(response.status).toBe(200);
+
+    const after = await db.users.findUnique({ where: { id: supervisorId } });
+    expect(after?.last_login_at).not.toBeNull();
+    expect(after?.last_login_at?.getTime()).toBeGreaterThan(
+      (before?.last_login_at?.getTime() ?? 0) - 1,
+    );
+  }, 120_000);
+
+  it("returns the documented login envelope and the institution timezone header", async () => {
+    const response = await login(COORDINATOR_EMAIL);
+    expect(response.status).toBe(200);
+
+    for (const field of DOCUMENTED_LOGIN_FIELDS) {
+      expect(response.body).toHaveProperty(field);
+    }
+    for (const field of DOCUMENTED_LOGIN_USER_FIELDS) {
+      expect(response.body.user).toHaveProperty(field);
+    }
+
+    expect(response.body.user).toEqual({
+      id: coordinatorId,
+      full_name: "Prof. Grace Okafor",
+      institution_id: institutionId,
+      institution_code: "TENA",
+      timezone_iana: "Africa/Lagos",
+      roles: [RoleCode.PROJECT_COORDINATOR],
+      coordinator_appointments: [
+        {
+          appointment_id: appointmentId,
+          programme_id: programmeId,
+          programme_name: "B.Sc. Computer Science",
+          academic_session_id: academicSessionId,
+          session_label: "2026/2027",
+        },
+      ],
+    });
+
+    // A Project Coordinator is a mandatory-MFA role (SEC-06): the session
+    // exists but has no full access until the challenge is completed.
+    expect(response.body.mfa_required).toBe(true);
+    expect(response.body.mfa_enrolled).toBe(false);
+    expect(response.body.mfa_verified).toBe(false);
+    expect(response.body.next_step).toBe("MFA_CHALLENGE_REQUIRED");
+    expect(response.body.inactivity_timeout_minutes).toBe(30);
+
+    // The tenant's authoritative timezone travels with the response.
+    expect(response.headers["x-clario-institution-timezone"]).toBe(
+      "Africa/Lagos",
+    );
+
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("Cookie", cookieFrom(response));
+  }, 120_000);
+
   it("logs in, authenticates, heartbeats and logs out", async () => {
     const loginResponse = await login(SUPERVISOR_EMAIL);
     expect(loginResponse.status).toBe(200);
@@ -312,6 +423,13 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     expect(row?.is_revoked).toBe(false);
     expect(row?.mfa_verified).toBe(false);
     expect(row?.inactivity_timeout_minutes).toBe(60);
+    // Creation, heartbeat and expiry timestamps are all persisted.
+    expect(row?.created_at).toBeInstanceOf(Date);
+    expect(row?.last_activity_at).toBeInstanceOf(Date);
+    expect(row?.expires_at).toBeInstanceOf(Date);
+    const createdAt = row?.created_at.getTime() ?? 0;
+    expect(row?.last_activity_at.getTime()).toBe(createdAt);
+    expect(row?.expires_at.getTime()).toBeGreaterThan(createdAt);
 
     const redisState = await redis.get(`clario:session:${sessionId}`);
     expect(redisState).not.toBeNull();
@@ -462,6 +580,52 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     const response = await request(app).get("/protected").set("Cookie", cookie);
     expect(response.status).toBe(401);
     expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+  }, 120_000);
+
+  it("rejects a session whose absolute lifetime elapsed", async () => {
+    const loginResponse = await login(SUPERVISOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    // Move the absolute deadline into the past, exactly as the passage of
+    // time would have done.
+    await patchRedisSession(sessionId, {
+      expiresAtUtc: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    // The PostgreSQL audit record records the expiry and the runtime state
+    // is dropped.
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("SESSION_EXPIRED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+  }, 120_000);
+
+  it("rejects a session whose inactivity window elapsed", async () => {
+    const loginResponse = await login(SUPERVISOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    // A supervisor session has a 60 minute inactivity timeout: push the last
+    // activity just beyond it.
+    await patchRedisSession(sessionId, {
+      lastActivityAtUtc: new Date(Date.now() - 61 * 60_000).toISOString(),
+    });
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("SESSION_INACTIVITY_TIMEOUT");
     expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
   }, 120_000);
 

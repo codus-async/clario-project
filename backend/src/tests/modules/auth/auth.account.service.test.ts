@@ -285,6 +285,7 @@ describe("AccountService.resetPassword", () => {
       ipAddress: null,
       userAgent: null,
       inactivityTimeoutMinutes: 60,
+      createdAt: new Date(),
       lastActivityAt: new Date(),
       expiresAt: new Date(Date.now() + 60 * 60_000),
     });
@@ -298,6 +299,7 @@ describe("AccountService.resetPassword", () => {
       ipAddress: null,
       userAgent: null,
       inactivityTimeoutMinutes: 60,
+      createdAt: new Date(),
       lastActivityAt: new Date(),
       expiresAt: new Date(Date.now() + 60 * 60_000),
     });

@@ -62,6 +62,7 @@ export class PrismaSessionRepository implements SessionRepository {
         ip_address: row.ipAddress,
         user_agent: row.userAgent,
         inactivity_timeout_minutes: row.inactivityTimeoutMinutes,
+        created_at: row.createdAt,
         last_activity_at: row.lastActivityAt,
         expires_at: row.expiresAt,
       },
