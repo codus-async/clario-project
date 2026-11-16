@@ -16,6 +16,8 @@ import { errorHandler } from "../../../middleware/error-handler.js";
 import { AppError } from "../../../errors/app-error.js";
 import { PrismaClient } from "../../../generated/prisma/client.js";
 import { Argon2PasswordHasher } from "../../../infrastructure/auth/argon2-password-hasher.js";
+import { LocalCompromisedPasswordChecker } from "../../../infrastructure/auth/compromised-password-checker.js";
+import { PrismaAccountRepository } from "../../../infrastructure/auth/prisma-account.repository.js";
 import {
   PrismaInstitutionRepository,
   PrismaRoleAssignmentRepository,
@@ -25,7 +27,9 @@ import { PrismaSessionRepository } from "../../../infrastructure/auth/prisma-ses
 import { RedisLoginProtectionStore } from "../../../infrastructure/auth/redis-login-protection.store.js";
 import { RedisSessionStore } from "../../../infrastructure/auth/redis-session.store.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
+import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
 import { createRequireSession } from "../../../modules/auth/auth.middleware.js";
+import { AccountService } from "../../../modules/auth/auth.account.service.js";
 import { AuthService } from "../../../modules/auth/auth.service.js";
 import type { PasswordHasher, VerificationSlot } from "../../../modules/auth/auth.ports.js";
 import { testAuthConfig } from "./auth.fakes.js";
@@ -229,10 +233,24 @@ beforeAll(async () => {
 
   const requireSession = createRequireSession(authService);
 
+  const accountService = new AccountService({
+    config: testAuthConfig,
+    hasher: countingHasher,
+    accounts: new PrismaAccountRepository(db),
+    institutions: new PrismaInstitutionRepository(db),
+    roles: new PrismaRoleAssignmentRepository(db),
+    sessions: new PrismaSessionRepository(db),
+    sessionStore: new RedisSessionStore(redis),
+    compromisedPasswords: new LocalCompromisedPasswordChecker(),
+  });
+
   app = express();
   app.use(requestContextMiddleware);
   app.use(express.json());
-  app.use("/api/v1/auth", createAuthRouter(authService, testAuthConfig));
+  app.use(
+    "/api/v1/auth",
+    createAuthRouter(authService, accountService, testAuthConfig),
+  );
   app.get("/protected", requireSession, (req, res) => {
     res.status(200).json({
       userId: req.authContext?.userId,
@@ -691,4 +709,124 @@ describe("RedisLoginProtectionStore verification slots", () => {
       await redis.del(...keys);
     }
   }, 30_000);
+});
+
+describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
+  const INVITED_EMAIL = "invited.student@tena.edu.ng";
+  const RESET_EMAIL = "reset.student@tena.edu.ng";
+
+  it("activates an invited account exactly once", async () => {
+    const token = "invitation-token-for-integration";
+    const tokenHash = hashSingleUseToken(token);
+
+    const invited = await sql.query<{ id: string }>(
+      `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, invitation_token_hash, invitation_expires_at)
+       VALUES ($1, false, 'Ada Invited', $2, 'TENA/STU/9001', 'INVITED', $3, NOW() + INTERVAL '1 day')
+       RETURNING id`,
+      [institutionId, INVITED_EMAIL, tokenHash],
+    );
+    const invitedId = firstRow(invited.rows).id;
+
+    await sql.query(
+      `INSERT INTO user_role_assignments (institution_id, user_id, role_code, assigned_by_user_id)
+       VALUES ($1, $2, 'STUDENT', $3)`,
+      [institutionId, invitedId, supervisorId],
+    );
+
+    const activated = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token, password: PASSWORD });
+    expect(activated.status).toBe(200);
+    expect(activated.body.account_status).toBe("ACTIVE");
+
+    const row = await db.users.findUnique({ where: { id: invitedId } });
+    expect(row?.account_status).toBe("ACTIVE");
+    expect(row?.password_hash).not.toBeNull();
+    // The invitation token is spent.
+    expect(row?.invitation_token_hash).toBeNull();
+    expect(row?.invitation_expires_at).toBeNull();
+
+    // The replay is rejected with the generic token error.
+    const replay = await request(app)
+      .post("/api/v1/auth/activate")
+      .send({ token, password: PASSWORD });
+    expect(replay.status).toBe(400);
+    expect(replay.body.error.code).toBe("VALIDATION_ERROR");
+
+    // The activated account can now authenticate.
+    const loginResponse = await login(INVITED_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    expect(loginResponse.body.user.id).toBe(invitedId);
+  }, 120_000);
+
+  it("records a transactional-email request and revokes every session on reset", async () => {
+    const user = await sql.query<{ id: string }>(
+      `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
+       VALUES ($1, false, 'Bode Reset', $2, 'TENA/STU/9002', 'ACTIVE', $3)
+       RETURNING id`,
+      [institutionId, RESET_EMAIL, supervisorPasswordHash],
+    );
+    const userId = firstRow(user.rows).id;
+
+    await sql.query(
+      `INSERT INTO user_role_assignments (institution_id, user_id, role_code, assigned_by_user_id)
+       VALUES ($1, $2, 'STUDENT', $3)`,
+      [institutionId, userId, supervisorId],
+    );
+
+    const loginResponse = await login(RESET_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const sessionId = String(loginResponse.body.session_id);
+    expect(await redis.get(`clario:session:${sessionId}`)).not.toBeNull();
+
+    const requested = await request(app)
+      .post("/api/v1/auth/password/forgot")
+      .send({ identifier: RESET_EMAIL, institutionCode: "TENA" });
+    expect(requested.status).toBe(202);
+
+    // The delivery request is recorded in the transactional outbox.
+    const outbox = await db.transactional_outbox_events.findFirst({
+      where: { aggregate_id: userId, event_type: "AUTH_PASSWORD_RESET_REQUESTED" },
+    });
+    expect(outbox).not.toBeNull();
+    expect(outbox?.processed).toBe(false);
+
+    const payload = outbox?.payload_jsonb as {
+      token: string;
+      email: string;
+    };
+    expect(payload.email).toBe(RESET_EMAIL);
+
+    // Only the digest of the token is stored on the account.
+    const withToken = await db.users.findUnique({ where: { id: userId } });
+    expect(withToken?.password_reset_token_hash).toBe(
+      hashSingleUseToken(payload.token),
+    );
+    expect(withToken?.password_reset_expires_at).not.toBeNull();
+
+    const reset = await request(app)
+      .post("/api/v1/auth/password/reset")
+      .send({ token: payload.token, password: "Brand-New-Strong-Pass-77!" });
+    expect(reset.status).toBe(200);
+
+    const afterReset = await db.users.findUnique({ where: { id: userId } });
+    expect(afterReset?.password_reset_token_hash).toBeNull();
+    expect(afterReset?.password_reset_expires_at).toBeNull();
+    expect(afterReset?.password_hash).not.toBe(supervisorPasswordHash);
+
+    // Every session of the account is revoked, in PostgreSQL and in Redis.
+    const session = await db.user_sessions.findUnique({
+      where: { id: sessionId },
+    });
+    expect(session?.is_revoked).toBe(true);
+    expect(session?.revoked_reason).toBe("PASSWORD_RESET");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+
+    // The token cannot be replayed.
+    const replay = await request(app)
+      .post("/api/v1/auth/password/reset")
+      .send({ token: payload.token, password: "Another-Strong-Pass-88!" });
+    expect(replay.status).toBe(400);
+    expect(replay.body.error.code).toBe("VALIDATION_ERROR");
+  }, 120_000);
 });

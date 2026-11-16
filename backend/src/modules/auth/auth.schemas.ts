@@ -86,8 +86,10 @@ export type LoginRequestBodyDtoParity = [
  * value is preserved. No UUID/hex format is invented here (F-64 §4.2).
  *
  * The password enforces the SEC-02 / AC-F64-01 minimum of 12 characters.
- * Compromised-password screening (SEC-03) is deliberately out of scope, and
- * the password is never trimmed before the length check.
+ * Compromised-password screening (SEC-03) is deliberately *not* a schema
+ * concern — it needs a breach-list lookup — and happens in the application
+ * service (`AccountService.activate`). The password is never trimmed before
+ * the length check.
  */
 export const activateRequestBodySchema = z.strictObject({
   token: z
@@ -102,6 +104,58 @@ export const activateRequestBodySchema = z.strictObject({
 });
 
 export type ActivateRequestBody = z.infer<typeof activateRequestBodySchema>;
+
+/**
+ * `POST /api/v1/auth/password/forgot`. The body mirrors the identifier
+ * fields of the login body: the identifier may be an email address or an
+ * institutional ID number, and the optional institution code disambiguates
+ * the tenant. No field of the response may reveal whether the identifier
+ * matched an account (SEC-04), which is a service concern — the schema
+ * only fixes the shape.
+ */
+export const passwordResetRequestBodySchema = z.strictObject({
+  identifier: z
+    .string()
+    .trim()
+    .min(1, "identifier is required.")
+    .max(
+      MAX_IDENTIFIER_LENGTH,
+      `identifier must be at most ${String(MAX_IDENTIFIER_LENGTH)} characters.`,
+    ),
+  institutionCode: z
+    .string()
+    .trim()
+    .min(1, "institutionCode must not be empty.")
+    .max(
+      MAX_INSTITUTION_CODE_LENGTH,
+      `institutionCode must be at most ${String(MAX_INSTITUTION_CODE_LENGTH)} characters.`,
+    )
+    .optional(),
+});
+
+export type PasswordResetRequestBody = z.infer<
+  typeof passwordResetRequestBodySchema
+>;
+
+/**
+ * `POST /api/v1/auth/password/reset`. The token is used exactly as
+ * presented (it is never trimmed, because its digest must match the stored
+ * digest); the password enforces the SEC-02 minimum of 12 characters and is
+ * never trimmed before the length check.
+ */
+export const passwordResetBodySchema = z.strictObject({
+  token: z
+    .string()
+    .refine((value) => value.trim().length > 0, "token is required."),
+  password: z
+    .string()
+    .min(
+      CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH,
+      `password must be at least ${String(CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH)} characters.`,
+    ),
+});
+
+export type PasswordResetBody = z.infer<typeof passwordResetBodySchema>;
 
 /**
  * Bodyless command contract for `POST /auth/logout` and

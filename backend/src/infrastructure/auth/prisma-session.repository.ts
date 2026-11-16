@@ -82,6 +82,21 @@ export class PrismaSessionRepository implements SessionRepository {
     });
   }
 
+  /**
+   * Revokes every live session of an account and returns their ids, so the
+   * caller can also drop the matching Redis runtime state (F-64 password
+   * reset revokes *all* sessions of the account).
+   */
+  async revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]> {
+    const rows = await this.client.user_sessions.updateManyAndReturn({
+      where: { user_id: userId, is_revoked: false },
+      data: { is_revoked: true, revoked_reason: reason },
+      select: { id: true },
+    });
+
+    return rows.map((row) => row.id);
+  }
+
   async touchActivity(sessionId: UUID, at: Date): Promise<void> {
     await this.client.user_sessions.updateMany({
       where: { id: sessionId, is_revoked: false },

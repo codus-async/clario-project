@@ -201,6 +201,31 @@ describe("AuthService.login", () => {
     expect(fixture.protection.failures).toHaveLength(1);
   });
 
+  it("rejects invited accounts with the generic authentication error", async () => {
+    const fixture = seededFixture();
+    const user = fixture.users.users[0];
+    expect(user).toBeDefined();
+    if (user !== undefined) {
+      user.accountStatus = "INVITED";
+      // An invited account has not chosen a password yet.
+      user.passwordHash = null;
+    }
+
+    const error = await expectAppError(
+      () => fixture.service.login(LOGIN_PAYLOAD),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+
+    // Anti-enumeration: an invited account is indistinguishable from an
+    // unknown one.
+    expect(error.message).toBe(
+      "Authentication failed. Provide a valid identifier and password.",
+    );
+    expect(fixture.sessionStore.states.size).toBe(0);
+    expect(fixture.sessions.rows.size).toBe(0);
+    expect(fixture.protection.failures).toHaveLength(1);
+  });
+
   it("rejects suspended tenants with the generic error at login", async () => {
     const fixture = seededFixture();
     const institution = fixture.institutions.institutions[0];
@@ -970,5 +995,129 @@ describe("AuthService.resolveSession role/scope revalidation", () => {
     const row = fixture.sessions.rows.get(login.sessionId);
     expect(row?.isRevoked).toBe(false);
     expect(fixture.sessionStore.states.has(login.sessionId)).toBe(true);
+  });
+});
+
+describe("AuthService.assertMfaSatisfied", () => {
+  function expectThrownCode(action: () => unknown, code: string): AppError {
+    let caught: unknown;
+    let thrown = false;
+    try {
+      action();
+    } catch (error) {
+      caught = error;
+      thrown = true;
+    }
+    expect(thrown, `expected ${code} to be thrown`).toBe(true);
+    expect(caught).toBeInstanceOf(AppError);
+    expect((caught as AppError).code).toBe(code);
+    return caught as AppError;
+  }
+
+  async function contextFor(
+    fixture: FakeAuthFixture,
+    roles: RoleCode[],
+  ) {
+    seedRoles(fixture, roles);
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    return fixture.service.resolveSession({
+      cookieSessionId: login.sessionId,
+      ip: "203.0.113.10",
+    });
+  }
+
+  it("blocks full access for an institutional admin until MFA is verified", async () => {
+    const fixture = seededFixture();
+    const context = await contextFor(fixture, [RoleCode.INSTITUTIONAL_ADMIN]);
+
+    expect(context.mfaRequired).toBe(true);
+    expect(context.mfaVerified).toBe(false);
+
+    const error = expectThrownCode(
+      () => fixture.service.assertMfaSatisfied(context),
+      ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+    );
+    expect(error.status).toBe(403);
+  });
+
+  it("blocks full access for a project coordinator until MFA is verified", async () => {
+    const fixture = seededFixture();
+    seedCoordinatorScopes(fixture, [coordinatorScope()]);
+    const context = await contextFor(fixture, [RoleCode.PROJECT_COORDINATOR]);
+
+    expect(context.mfaRequired).toBe(true);
+    expectThrownCode(
+      () => fixture.service.assertMfaSatisfied(context),
+      ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+    );
+  });
+
+  it("blocks full access for a platform admin until MFA is verified", async () => {
+    const fixture = createFakeAuthFixture();
+    fixture.users.users.push({
+      id: "99999999-9999-4999-8999-999999999999",
+      institutionId: null,
+      isPlatformAdmin: true,
+      fullName: "Root Admin",
+      email: "root@clario.ng",
+      institutionalIdNumber: null,
+      accountStatus: "ACTIVE",
+      passwordHash: "fake-argon2id$Correct-Horse-Battery-Staple-99!",
+      mfaRequired: true,
+      mfaEnrolled: false,
+    });
+
+    const login = await fixture.service.login({
+      identifier: "root@clario.ng",
+      password: PASSWORD,
+      ip: "203.0.113.10",
+    });
+    const context = await fixture.service.resolveSession({
+      cookieSessionId: login.sessionId,
+      ip: "203.0.113.10",
+    });
+
+    expect(context.mfaRequired).toBe(true);
+    expectThrownCode(
+      () => fixture.service.assertMfaSatisfied(context),
+      ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+    );
+  });
+
+  it("allows full access once the MFA challenge is completed", async () => {
+    const fixture = seededFixture();
+    const context = await contextFor(fixture, [RoleCode.INSTITUTIONAL_ADMIN]);
+
+    expect(() =>
+      fixture.service.assertMfaSatisfied({
+        ...context,
+        mfaVerified: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it("does not demand MFA for a role that does not require it", async () => {
+    const fixture = seededFixture();
+    const context = await contextFor(fixture, [RoleCode.PROJECT_SUPERVISOR]);
+
+    expect(context.mfaRequired).toBe(false);
+    expect(() => fixture.service.assertMfaSatisfied(context)).not.toThrow();
+  });
+
+  it("demands MFA for an account flagged mfa_required even without a mandatory role", async () => {
+    const fixture = seededFixture();
+    const user = fixture.users.users[0];
+    expect(user).toBeDefined();
+    if (user !== undefined) {
+      user.mfaRequired = true;
+    }
+
+    const context = await contextFor(fixture, [RoleCode.PROJECT_SUPERVISOR]);
+
+    expect(context.mfaRequired).toBe(true);
+    expectThrownCode(
+      () => fixture.service.assertMfaSatisfied(context),
+      ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+    );
   });
 });
