@@ -16,6 +16,7 @@ import {
   inactivityTimeoutMinutesFor,
   type AuthConfig,
 } from "./auth.config.js";
+import { MAX_PASSWORD_LENGTH } from "./auth.password-policy.js";
 import { isRoleCode } from "./auth.role-code.js";
 import type {
   InstitutionRecord,
@@ -24,6 +25,7 @@ import type {
   LoginUserRecord,
   PasswordHasher,
   RoleAssignmentRepository,
+  SessionCreationResult,
   SessionRepository,
   SessionStore,
   UserRepository,
@@ -45,8 +47,15 @@ import type {
  * keeping the HTTP edge and the application service in lock-step.
  */
 export const MAX_IDENTIFIER_LENGTH = 320;
-export const MAX_PASSWORD_LENGTH = 1024;
 export const MAX_INSTITUTION_CODE_LENGTH = 64;
+
+/**
+ * The password bound lives with the password policy, so the login boundary
+ * and the password-*creation* paths (activation, reset) share one single
+ * source of truth. Re-exported here because the login boundary is what the
+ * request schemas import.
+ */
+export { MAX_PASSWORD_LENGTH };
 
 const MAX_USER_AGENT_LENGTH = 1_000;
 
@@ -376,22 +385,30 @@ export class AuthService {
       lastActivityAtUtc: new Date(now).toISOString(),
     };
 
+    let creation: SessionCreationResult;
     try {
-      await this.sessions.create({
-        id: sessionId,
-        userId: user.id,
-        institutionId: state.institutionId,
-        activeRole,
-        activeCoordinatorAppointmentId:
-          activeCoordinatorScope?.appointmentId ?? null,
-        mfaVerified: false,
-        ipAddress: normalizeIpAddress(input.ip),
-        userAgent: normalizeUserAgent(input.userAgent),
-        inactivityTimeoutMinutes,
-        createdAt: new Date(now),
-        lastActivityAt: new Date(now),
-        expiresAt,
-      });
+      creation = await this.sessions.create(
+        {
+          id: sessionId,
+          userId: user.id,
+          institutionId: state.institutionId,
+          activeRole,
+          activeCoordinatorAppointmentId:
+            activeCoordinatorScope?.appointmentId ?? null,
+          mfaVerified: false,
+          ipAddress: normalizeIpAddress(input.ip),
+          userAgent: normalizeUserAgent(input.userAgent),
+          inactivityTimeoutMinutes,
+          createdAt: new Date(now),
+          lastActivityAt: new Date(now),
+          expiresAt,
+        },
+        // The session row is fenced on the credential this login verified: a
+        // password reset that lands while the login is in flight revokes
+        // every session of the account, and this row can only be created
+        // while the account still carries the hash that was verified.
+        { passwordHash: user.passwordHash },
+      );
     } catch (error) {
       baseLogger.error(
         { err: error, module: "auth" },
@@ -401,6 +418,17 @@ export class AuthService {
         ERROR_CODES.SERVICE_UNAVAILABLE,
         "The session could not be established. Please try again.",
       );
+    }
+
+    if (!creation.created) {
+      // The credential changed underneath the login (a password reset): the
+      // session must not be established. The failure is generic, like every
+      // other authentication failure.
+      baseLogger.warn(
+        { module: "auth", userId: user.id },
+        "Rejected the session creation because the credential changed",
+      );
+      throw authenticationFailed();
     }
 
     try {

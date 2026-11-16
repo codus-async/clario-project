@@ -16,6 +16,7 @@ import type {
   AccountRepository,
   ActivateAccountInput,
   ConsumePasswordResetInput,
+  ConsumePasswordResetResult,
   InstitutionRecord,
   InstitutionRepository,
   IssuePasswordResetInput,
@@ -25,6 +26,8 @@ import type {
   PasswordHasher,
   ProtectionCheckResult,
   RoleAssignmentRepository,
+  SessionCreationResult,
+  SessionCredentialFence,
   SessionRecord,
   SessionRepository,
   SessionStore,
@@ -43,6 +46,8 @@ export const testAuthConfig: AuthConfig = resolveAuthConfig(
     DIRECT_URL: "postgresql://user:pass@localhost:5432/clario",
     REDIS_URL: "redis://localhost:6379",
     LOG_LEVEL: "info",
+    OUTBOX_PAYLOAD_ENCRYPTION_KEY:
+      "Y2xhcmlvLWRldi1vbmx5LXBheWxvYWQta2V5LTAwMDA=",
   }),
 );
 
@@ -158,13 +163,29 @@ export class FakeSessionRepository implements SessionRepository {
   rows = new Map<string, StoredSessionRow>();
   createShouldFail = false;
   markRevokedShouldFail = false;
-  revokeAllForUserShouldFail = false;
+  /**
+   * Resolves the *current* password hash of an account. The real adapter
+   * fences the session row on `users.password_hash`; the fake resolves the
+   * same value through the shared `users` table.
+   */
+  credentialHashOf: (userId: UUID) => string | null = () => null;
 
-  async create(row: NewSessionRow): Promise<void> {
+  async create(
+    row: NewSessionRow,
+    fence: SessionCredentialFence,
+  ): Promise<SessionCreationResult> {
     if (this.createShouldFail) {
       throw new Error("postgres unavailable");
     }
+
+    const currentHash = this.credentialHashOf(row.userId);
+    if (currentHash === null || currentHash !== fence.passwordHash) {
+      // The credential changed underneath the login: no session row.
+      return { created: false, reason: "CREDENTIAL_CHANGED" };
+    }
+
     this.rows.set(row.id, { ...row, isRevoked: false, revokedReason: null });
+    return { created: true };
   }
 
   async findById(sessionId: UUID): Promise<SessionRecord | null> {
@@ -193,10 +214,12 @@ export class FakeSessionRepository implements SessionRepository {
     }
   }
 
-  async revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]> {
-    if (this.revokeAllForUserShouldFail) {
-      throw new Error("postgres unavailable");
-    }
+  /**
+   * Revokes every live session of an account. The real adapter performs
+   * this write inside the password-reset transaction; the fake exposes it
+   * so the fake account repository can emulate the same transaction.
+   */
+  revokeSessionsOfUser(userId: UUID, reason: string): UUID[] {
     const revoked: UUID[] = [];
     for (const row of this.rows.values()) {
       if (row.userId === userId && !row.isRevoked) {
@@ -320,6 +343,18 @@ export class FakeAccountRepository implements AccountRepository {
   accounts: FakeAccountRecord[] = [];
   /** Every password-reset issuance, including the raw token. */
   issuedResets: IssuePasswordResetInput[] = [];
+  /** Makes the reset transaction fail. */
+  consumeShouldFail = false;
+  /**
+   * Applies the new password to the shared `users` table — the real
+   * adapter writes `users.password_hash` in the reset transaction.
+   */
+  applyPasswordHash: (userId: UUID, passwordHash: string) => void = () => {};
+  /**
+   * Revokes the sessions of the account — the real adapter writes
+   * `user_sessions.is_revoked` in the *same* transaction as the password.
+   */
+  revokeSessionsOfUser: (userId: UUID, reason: string) => UUID[] = () => [];
 
   async findByInvitationTokenHash(
     tokenHash: string,
@@ -384,6 +419,9 @@ export class FakeAccountRepository implements AccountRepository {
     account.mfaRequired = input.mfaRequired;
     account.invitationTokenHash = null;
     account.invitationExpiresAt = null;
+    // The activation writes `users.password_hash` — the same row the login
+    // path reads.
+    this.applyPasswordHash(input.userId, input.passwordHash);
     return true;
   }
 
@@ -402,27 +440,41 @@ export class FakeAccountRepository implements AccountRepository {
 
   async consumePasswordReset(
     input: ConsumePasswordResetInput,
-  ): Promise<boolean> {
+  ): Promise<ConsumePasswordResetResult> {
+    if (this.consumeShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+
     const account = this.accounts.find(
       (candidate) => candidate.id === input.userId,
     );
     if (account === undefined) {
-      return false;
+      return { applied: false, revokedSessionIds: [] };
     }
     if (account.passwordResetTokenHash !== input.tokenHash) {
-      return false;
+      return { applied: false, revokedSessionIds: [] };
     }
     if (
       account.passwordResetExpiresAt === null ||
       account.passwordResetExpiresAt.getTime() <= input.now.getTime()
     ) {
-      return false;
+      return { applied: false, revokedSessionIds: [] };
     }
 
     account.passwordHash = input.passwordHash;
     account.passwordResetTokenHash = null;
     account.passwordResetExpiresAt = null;
-    return true;
+
+    // The password write and the session revocation are one transaction in
+    // the real adapter; the fake applies both and reports the revoked
+    // sessions the way the adapter does.
+    this.applyPasswordHash(input.userId, input.passwordHash);
+    const revokedSessionIds = this.revokeSessionsOfUser(
+      input.userId,
+      input.revokeReason,
+    );
+
+    return { applied: true, revokedSessionIds };
   }
 }
 
@@ -468,10 +520,25 @@ export function createFakeAuthFixture(): FakeAuthFixture {
     accounts,
     institutions,
     roles,
-    sessions,
     sessionStore,
     compromisedPasswords,
   });
+
+  // The `users` table is shared by the login path and the account-lifecycle
+  // path: the fake repositories are wired to each other so a password reset
+  // changes the hash the session fence is checked against.
+  sessions.credentialHashOf = (userId: UUID) =>
+    users.users.find((user) => user.id === userId)?.passwordHash ?? null;
+
+  accounts.applyPasswordHash = (userId: UUID, passwordHash: string) => {
+    const user = users.users.find((candidate) => candidate.id === userId);
+    if (user !== undefined) {
+      user.passwordHash = passwordHash;
+    }
+  };
+
+  accounts.revokeSessionsOfUser = (userId: UUID, reason: string) =>
+    sessions.revokeSessionsOfUser(userId, reason);
 
   return {
     service,

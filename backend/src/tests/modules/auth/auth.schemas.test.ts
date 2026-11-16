@@ -4,7 +4,9 @@ import {
   activateRequestBodySchema,
   emptyRequestBodySchema,
   loginRequestBodySchema,
+  passwordResetBodySchema,
 } from "../../../modules/auth/auth.schemas.js";
+import { MAX_PASSWORD_LENGTH } from "../../../modules/auth/auth.password-policy.js";
 
 const VALID_LOGIN = {
   identifier: "tunde.adewale@unilag.edu.ng",
@@ -282,6 +284,76 @@ describe("activateRequestBodySchema", () => {
         password: ` ${"a".repeat(11)}`,
       }),
     ).toBe(true);
+  });
+
+  it("rejects a password longer than the login boundary accepts", () => {
+    // A password the login schema rejects would lock the account out of
+    // its own login, so the activation boundary must reject it too.
+    expect(
+      parse(activateRequestBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(MAX_PASSWORD_LENGTH + 1),
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts a password of exactly the documented maximum", () => {
+    expect(
+      parse(activateRequestBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(MAX_PASSWORD_LENGTH),
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("passwordResetBodySchema", () => {
+  it("accepts a valid token with a 12-character password", () => {
+    expect(
+      parse(passwordResetBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(12),
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a password shorter than 12 characters", () => {
+    expect(
+      parse(passwordResetBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(11),
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects a password longer than the login boundary accepts", () => {
+    // The same mismatch the activation boundary had: a reset password the
+    // login schema rejects would make the account unusable.
+    expect(
+      parse(passwordResetBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(MAX_PASSWORD_LENGTH + 1),
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts a password of exactly the documented maximum", () => {
+    expect(
+      parse(passwordResetBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(MAX_PASSWORD_LENGTH),
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects unknown request fields", () => {
+    expect(
+      parse(passwordResetBodySchema, {
+        token: VALID_TOKEN,
+        password: "a".repeat(12),
+        rememberMe: true,
+      }),
+    ).toBe(false);
   });
 });
 

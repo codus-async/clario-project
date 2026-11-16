@@ -1,4 +1,5 @@
 
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -57,6 +58,28 @@ const timezoneSchema = z.string().refine(
 const positiveMinutes = z.coerce.number().int().positive();
 
 /**
+ * The development-only key that ships in `.env.example`. It is a valid
+ * 32-byte key so a fresh checkout boots, and it is rejected outright in
+ * production — a deployment that still carries it is refused at startup
+ * rather than silently encrypting live credentials with a public key.
+ */
+export const PAYLOAD_ENCRYPTION_KEY_PLACEHOLDER =
+  "Y2xhcmlvLWRldi1vbmx5LXBheWxvYWQta2V5LTAwMDA=";
+
+/**
+ * Base64-encoded 32-byte key that encrypts the secrets carried by
+ * transactional-outbox payloads (F-71). A single-use password-reset token
+ * is a live credential, so it must never be readable in the database.
+ */
+const payloadEncryptionKeySchema = z
+  .string()
+  .min(1, "OUTBOX_PAYLOAD_ENCRYPTION_KEY is required.")
+  .refine((value) => {
+    const decoded = Buffer.from(value, "base64");
+    return decoded.length === 32 && decoded.toString("base64") === value;
+  }, "Must be a base64-encoded 32-byte key.");
+
+/**
  * F-64 / F-65 configuration. Every authentication threshold and timeout stays
  * configuration-driven (implementation defaults §7, §11); the defaults below
  * are the values documented in clario_mvp_implementation_defaults.md §7 and
@@ -109,6 +132,13 @@ export const EnvironmentSchema = z.object({
   /** Lifetime of the single-use self-service password-reset token. */
   PASSWORD_RESET_TOKEN_TTL_MINUTES: positiveMinutes.default(30),
 
+  /**
+   * Base64-encoded 32-byte key used to encrypt the secrets carried by the
+   * transactional outbox (F-71). Required in every environment: the
+   * password-reset token must never sit in the database in clear text.
+   */
+  OUTBOX_PAYLOAD_ENCRYPTION_KEY: payloadEncryptionKeySchema,
+
   LOGIN_MAX_FAILED_ATTEMPTS: z.coerce.number().int().positive().default(5),
   LOGIN_FAILURE_WINDOW_MINUTES: positiveMinutes.default(15),
   LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: positiveMinutes.default(15),
@@ -149,6 +179,19 @@ export const EnvironmentSchema = z.object({
       path: ["LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES"],
       message:
         "must be >= LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES (the base cooldown would never apply otherwise)",
+    });
+  }
+
+  if (
+    data.NODE_ENV === "production" &&
+    data.OUTBOX_PAYLOAD_ENCRYPTION_KEY ===
+      PAYLOAD_ENCRYPTION_KEY_PLACEHOLDER
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["OUTBOX_PAYLOAD_ENCRYPTION_KEY"],
+      message:
+        "must not be the documented development placeholder in production (generate one with: node -e \"console.log(require('node:crypto').randomBytes(32).toString('base64'))\")",
     });
   }
 });

@@ -85,11 +85,13 @@ export type LoginRequestBodyDtoParity = [
  * established safely: a non-empty, non-whitespace-only string whose exact
  * value is preserved. No UUID/hex format is invented here (F-64 §4.2).
  *
- * The password enforces the SEC-02 / AC-F64-01 minimum of 12 characters.
- * Compromised-password screening (SEC-03) is deliberately *not* a schema
- * concern — it needs a breach-list lookup — and happens in the application
- * service (`AccountService.activate`). The password is never trimmed before
- * the length check.
+ * The password enforces the SEC-02 / AC-F64-01 minimum of 12 characters and
+ * the same upper bound the login boundary enforces, so an account that is
+ * activated with this password can always sign in again. Compromised-password
+ * screening (SEC-03) is deliberately *not* a schema concern — it needs a
+ * breach-list lookup — and happens in the application service
+ * (`AccountService.activate`). The password is never trimmed before the
+ * length check.
  */
 export const activateRequestBodySchema = z.strictObject({
   token: z
@@ -100,6 +102,10 @@ export const activateRequestBodySchema = z.strictObject({
     .min(
       CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH,
       `password must be at least ${String(CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH)} characters.`,
+    )
+    .max(
+      MAX_PASSWORD_LENGTH,
+      `password must be at most ${String(MAX_PASSWORD_LENGTH)} characters.`,
     ),
 });
 
@@ -140,8 +146,9 @@ export type PasswordResetRequestBody = z.infer<
 /**
  * `POST /api/v1/auth/password/reset`. The token is used exactly as
  * presented (it is never trimmed, because its digest must match the stored
- * digest); the password enforces the SEC-02 minimum of 12 characters and is
- * never trimmed before the length check.
+ * digest); the password enforces the SEC-02 minimum of 12 characters and
+ * the same upper bound the login boundary enforces, so the new password can
+ * always be used to sign in. It is never trimmed before the length check.
  */
 export const passwordResetBodySchema = z.strictObject({
   token: z
@@ -152,6 +159,10 @@ export const passwordResetBodySchema = z.strictObject({
     .min(
       CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH,
       `password must be at least ${String(CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH)} characters.`,
+    )
+    .max(
+      MAX_PASSWORD_LENGTH,
+      `password must be at most ${String(MAX_PASSWORD_LENGTH)} characters.`,
     ),
 });
 

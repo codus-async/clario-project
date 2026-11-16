@@ -26,6 +26,7 @@ import {
 import { PrismaSessionRepository } from "../../../infrastructure/auth/prisma-session.repository.js";
 import { RedisLoginProtectionStore } from "../../../infrastructure/auth/redis-login-protection.store.js";
 import { RedisSessionStore } from "../../../infrastructure/auth/redis-session.store.js";
+import { PayloadCipher } from "../../../infrastructure/security/payload-cipher.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
 import { createRequireSession } from "../../../modules/auth/auth.middleware.js";
@@ -46,6 +47,13 @@ const POSTGRES_DB = "clario";
 const PASSWORD = "Correct-Horse-Battery-Staple-99!";
 const SUPERVISOR_EMAIL = "tunde.adewale@unilag.edu.ng";
 const COORDINATOR_EMAIL = "coordinator@unilag.edu.ng";
+
+/**
+ * The key the outbox payload is encrypted with in this test. The relay (F-71)
+ * decrypts with the same key.
+ */
+const OUTBOX_KEY = "Y2xhcmlvLWRldi1vbmx5LXBheWxvYWQta2V5LTAwMDA=";
+const PASSWORD_RESET_EVENT_TYPE = "AUTH_PASSWORD_RESET_REQUESTED";
 
 /**
  * Wraps the real Argon2id hasher to observe how many KDF invocations run in
@@ -238,10 +246,12 @@ beforeAll(async () => {
   const accountService = new AccountService({
     config: testAuthConfig,
     hasher: countingHasher,
-    accounts: new PrismaAccountRepository(db),
+    accounts: new PrismaAccountRepository(
+      db,
+      new PayloadCipher(OUTBOX_KEY),
+    ),
     institutions: new PrismaInstitutionRepository(db),
     roles: new PrismaRoleAssignmentRepository(db),
-    sessions: new PrismaSessionRepository(db),
     sessionStore: new RedisSessionStore(redis),
     compromisedPasswords: new LocalCompromisedPasswordChecker(),
   });
@@ -879,6 +889,51 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
   const INVITED_EMAIL = "invited.student@tena.edu.ng";
   const RESET_EMAIL = "reset.student@tena.edu.ng";
 
+  it("does not create a session row for a credential that changed", async () => {
+    // The session row is fenced on the password hash the login verified: a
+    // password reset that landed in the meantime changes the hash, so the
+    // session must not be created.
+    const user = await sql.query<{ id: string }>(
+      `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
+       VALUES ($1, false, 'Fence Check', $2, 'TENA/STU/9003', 'ACTIVE', $3)
+       RETURNING id`,
+      [institutionId, "fence.student@tena.edu.ng", supervisorPasswordHash],
+    );
+    const userId = firstRow(user.rows).id;
+
+    const sessions = new PrismaSessionRepository(db);
+    const row = {
+      id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      userId,
+      institutionId,
+      activeRole: RoleCode.STUDENT,
+      activeCoordinatorAppointmentId: null,
+      mfaVerified: false,
+      ipAddress: null,
+      userAgent: null,
+      inactivityTimeoutMinutes: 60,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      expiresAt: new Date(Date.now() + 60 * 60_000),
+    };
+
+    const stale = await sessions.create(row, {
+      passwordHash: "a-stale-password-hash",
+    });
+    expect(stale.created).toBe(false);
+    expect(
+      await db.user_sessions.findUnique({ where: { id: row.id } }),
+    ).toBeNull();
+
+    // The current hash passes the fence.
+    const current = await sessions.create(row, {
+      passwordHash: supervisorPasswordHash,
+    });
+    expect(current.created).toBe(true);
+
+    await db.user_sessions.delete({ where: { id: row.id } });
+  }, 60_000);
+
   it("activates an invited account exactly once", async () => {
     const token = "invitation-token-for-integration";
     const tokenHash = hashSingleUseToken(token);
@@ -950,27 +1005,38 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
 
     // The delivery request is recorded in the transactional outbox.
     const outbox = await db.transactional_outbox_events.findFirst({
-      where: { aggregate_id: userId, event_type: "AUTH_PASSWORD_RESET_REQUESTED" },
+      where: { aggregate_id: userId, event_type: PASSWORD_RESET_EVENT_TYPE },
     });
     expect(outbox).not.toBeNull();
     expect(outbox?.processed).toBe(false);
 
     const payload = outbox?.payload_jsonb as {
-      token: string;
+      token_encrypted: string;
       email: string;
     };
     expect(payload.email).toBe(RESET_EMAIL);
 
+    // The raw token is never stored: the payload carries the encrypted
+    // envelope, and the relay decrypts it with the application key.
+    expect(payload).not.toHaveProperty("token");
+    const rawToken = new PayloadCipher(OUTBOX_KEY).decrypt(
+      payload.token_encrypted,
+      `${userId}|${PASSWORD_RESET_EVENT_TYPE}`,
+    );
+    expect(rawToken.length).toBeGreaterThan(0);
+    // The stored row holds no clear-text credential.
+    expect(JSON.stringify(payload)).not.toContain(rawToken);
+
     // Only the digest of the token is stored on the account.
     const withToken = await db.users.findUnique({ where: { id: userId } });
     expect(withToken?.password_reset_token_hash).toBe(
-      hashSingleUseToken(payload.token),
+      hashSingleUseToken(rawToken),
     );
     expect(withToken?.password_reset_expires_at).not.toBeNull();
 
     const reset = await request(app)
       .post("/api/v1/auth/password/reset")
-      .send({ token: payload.token, password: "Brand-New-Strong-Pass-77!" });
+      .send({ token: rawToken, password: "Brand-New-Strong-Pass-77!" });
     expect(reset.status).toBe(200);
 
     const afterReset = await db.users.findUnique({ where: { id: userId } });
@@ -989,7 +1055,7 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
     // The token cannot be replayed.
     const replay = await request(app)
       .post("/api/v1/auth/password/reset")
-      .send({ token: payload.token, password: "Another-Strong-Pass-88!" });
+      .send({ token: rawToken, password: "Another-Strong-Pass-88!" });
     expect(replay.status).toBe(400);
     expect(replay.body.error.code).toBe("VALIDATION_ERROR");
   }, 120_000);

@@ -13,6 +13,7 @@ import {
   seedInstitution,
   seedRoles,
   seedSessionState,
+  seedTenantUser,
   type FakeAccountRecord,
   type FakeAuthFixture,
 } from "./auth.fakes.js";
@@ -267,6 +268,9 @@ describe("AccountService.resetPassword", () => {
       passwordResetTokenHash: hashSingleUseToken(PASSWORD_RESET_TOKEN),
       passwordResetExpiresAt: new Date(Date.now() + 30 * 60_000),
     });
+    // The login path reads the same `users` row, so the account is seeded
+    // there as well: the session fence is checked against it.
+    seedTenantUser(fixture);
     return fixture;
   }
 
@@ -275,34 +279,40 @@ describe("AccountService.resetPassword", () => {
     const userId = fixture.accounts.accounts[0]?.id as string;
 
     // Two live sessions of the account.
-    await fixture.sessions.create({
-      id: "session-one",
-      userId,
-      institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
-      activeRole: RoleCode.STUDENT,
-      activeCoordinatorAppointmentId: null,
-      mfaVerified: false,
-      ipAddress: null,
-      userAgent: null,
-      inactivityTimeoutMinutes: 60,
-      createdAt: new Date(),
-      lastActivityAt: new Date(),
-      expiresAt: new Date(Date.now() + 60 * 60_000),
-    });
-    await fixture.sessions.create({
-      id: "session-two",
-      userId,
-      institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
-      activeRole: RoleCode.STUDENT,
-      activeCoordinatorAppointmentId: null,
-      mfaVerified: false,
-      ipAddress: null,
-      userAgent: null,
-      inactivityTimeoutMinutes: 60,
-      createdAt: new Date(),
-      lastActivityAt: new Date(),
-      expiresAt: new Date(Date.now() + 60 * 60_000),
-    });
+    await fixture.sessions.create(
+      {
+        id: "session-one",
+        userId,
+        institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
+        activeRole: RoleCode.STUDENT,
+        activeCoordinatorAppointmentId: null,
+        mfaVerified: false,
+        ipAddress: null,
+        userAgent: null,
+        inactivityTimeoutMinutes: 60,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+      },
+      { passwordHash: `fake-argon2id$${PASSWORD}` },
+    );
+    await fixture.sessions.create(
+      {
+        id: "session-two",
+        userId,
+        institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
+        activeRole: RoleCode.STUDENT,
+        activeCoordinatorAppointmentId: null,
+        mfaVerified: false,
+        ipAddress: null,
+        userAgent: null,
+        inactivityTimeoutMinutes: 60,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+      },
+      { passwordHash: `fake-argon2id$${PASSWORD}` },
+    );
     seedSessionState(fixture, "session-one");
 
     await fixture.accountService.resetPassword({
@@ -323,6 +333,42 @@ describe("AccountService.resetPassword", () => {
       "PASSWORD_RESET",
     );
     expect(fixture.sessionStore.states.has("session-one")).toBe(false);
+  });
+
+  it("applies the new password and the session revocation as one operation", async () => {
+    const fixture = seededActiveAccount();
+    const userId = fixture.accounts.accounts[0]?.id as string;
+
+    await fixture.sessions.create(
+      {
+        id: "session-three",
+        userId,
+        institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
+        activeRole: RoleCode.STUDENT,
+        activeCoordinatorAppointmentId: null,
+        mfaVerified: false,
+        ipAddress: null,
+        userAgent: null,
+        inactivityTimeoutMinutes: 60,
+        createdAt: new Date(),
+        lastActivityAt: new Date(),
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+      },
+      { passwordHash: `fake-argon2id$${PASSWORD}` },
+    );
+
+    await fixture.accountService.resetPassword({
+      token: PASSWORD_RESET_TOKEN,
+      password: NEW_PASSWORD,
+    });
+
+    // The stored hash changed *and* the session was revoked: there is no
+    // state in which the new password is stored while a session of the
+    // account survives.
+    expect(fixture.accounts.accounts[0]?.passwordHash).toBe(
+      `fake-argon2id$${NEW_PASSWORD}`,
+    );
+    expect(fixture.sessions.rows.get("session-three")?.isRevoked).toBe(true);
   });
 
   it("rejects a reset token that was already used", async () => {
@@ -380,9 +426,9 @@ describe("AccountService.resetPassword", () => {
     );
   });
 
-  it("fails closed when the sessions cannot be revoked", async () => {
+  it("fails closed when the reset transaction cannot be applied", async () => {
     const fixture = seededActiveAccount();
-    fixture.sessions.revokeAllForUserShouldFail = true;
+    fixture.accounts.consumeShouldFail = true;
 
     await expectAppError(
       () =>
@@ -393,9 +439,13 @@ describe("AccountService.resetPassword", () => {
       ERROR_CODES.SERVICE_UNAVAILABLE,
     );
 
-    // The password was not changed while the old sessions stay revoked.
+    // Neither the password nor the sessions changed: the transaction is
+    // atomic, so a failed reset leaves the account exactly as it was.
     expect(fixture.accounts.accounts[0]?.passwordHash).toBe(
       `fake-argon2id$${PASSWORD}`,
+    );
+    expect(fixture.accounts.accounts[0]?.passwordResetTokenHash).toBe(
+      hashSingleUseToken(PASSWORD_RESET_TOKEN),
     );
   });
 });

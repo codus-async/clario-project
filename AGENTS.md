@@ -105,7 +105,8 @@ pnpm --filter backend test
 ## 6. Env and dev services
 
 - One **root** `.env` (gitignored) feeds everything; `backend/src/config/env.ts` loads it and Zod-validates eagerly — importing backend config without a valid `.env` throws at import time. Bootstrap with `cp .env.example .env`.
-- `infrastructure/docker/docker-compose.yml` runs Postgres 16 on host port **5433** and Redis 7 on **6380** (non-default ports, to avoid clashes with other local containers). `.env.example` still lists the defaults `5432`/`6379` — align `DATABASE_URL`/`REDIS_URL` with the compose ports before trusting them. Compose reads `POSTGRES_PASSWORD` from the environment.
+- `infrastructure/docker/docker-compose.yml` runs Postgres 16 on host port **5433** and Redis 7 on **6380** (non-default ports, to avoid clashes with other local containers). `.env.example` already points `DATABASE_URL`/`DIRECT_URL`/`REDIS_URL` at those ports — keep them aligned. Compose reads `POSTGRES_PASSWORD` from the environment.
+- `OUTBOX_PAYLOAD_ENCRYPTION_KEY` (base64, 32 bytes) is **required**: it encrypts the live credentials carried by transactional-outbox payloads (F-71). `.env.example` ships a development placeholder that the config rejects when `NODE_ENV=production`.
 - Backend dev: `pnpm --filter backend dev` (tsx watch, `PORT=3000`). `next dev` also defaults to port 3000 — pick another port when running both.
 
 ## 7. Prisma and schema (easy to get wrong)

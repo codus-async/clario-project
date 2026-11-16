@@ -105,17 +105,43 @@ export interface SessionRecord {
   revokedReason: string | null;
 }
 
+/**
+ * The credential a session was established with.
+ *
+ * The session row is only created while the account still carries this
+ * exact password hash. It closes the window in which a login that is in
+ * flight *while* a password reset lands could establish a session with the
+ * old password: the reset writes the new hash and revokes every session of
+ * the account in one transaction, and the session row can only be created
+ * against the hash the login actually verified.
+ */
+export interface SessionCredentialFence {
+  /** The password hash the session was authenticated against. */
+  passwordHash: string;
+}
+
+/**
+ * Outcome of a (fenced) session creation.
+ */
+export type SessionCreationResult =
+  | { created: true }
+  | { created: false; reason: "CREDENTIAL_CHANGED" };
+
 export interface SessionRepository {
-  create(row: NewSessionRow): Promise<void>;
+  /**
+   * Creates the session row, fenced on the credential it was authenticated
+   * with. The row is only written while the account still carries that
+   * exact password hash, so a password reset that lands in the meantime
+   * either rejects the creation or revokes the row — never leaves a live
+   * session behind.
+   */
+  create(
+    row: NewSessionRow,
+    fence: SessionCredentialFence,
+  ): Promise<SessionCreationResult>;
   findById(sessionId: UUID): Promise<SessionRecord | null>;
   markRevoked(sessionId: UUID, reason: string): Promise<void>;
   touchActivity(sessionId: UUID, at: Date): Promise<void>;
-  /**
-   * Revokes every non-revoked session of an account and returns the ids of
-   * the sessions it revoked, so the caller can also drop the matching
-   * runtime state (F-64 password reset revokes *all* sessions).
-   */
-  revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]>;
 }
 
 export interface SessionStore {
@@ -204,7 +230,24 @@ export interface ConsumePasswordResetInput {
   /** Digest of the reset token that was presented. */
   tokenHash: string;
   passwordHash: string;
+  /** Reason recorded on every session the reset revokes. */
+  revokeReason: string;
   now: Date;
+}
+
+export interface ConsumePasswordResetResult {
+  /**
+   * Whether the reset was applied. `false` when the token was already
+   * consumed or expired — in that case nothing was written and no session
+   * was revoked.
+   */
+  applied: boolean;
+  /**
+   * The ids of the sessions that were revoked by the *same* transaction that
+   * stored the new password, so the caller can also drop the matching
+   * runtime state.
+   */
+  revokedSessionIds: UUID[];
 }
 
 /**
@@ -246,8 +289,18 @@ export interface AccountRepository {
    */
   issuePasswordReset(input: IssuePasswordResetInput): Promise<void>;
   /**
-   * Applies the new password and clears the reset token in one conditional
-   * write. Returns `false` when the token was already consumed or expired.
+   * Applies the new password, clears the reset token and revokes every
+   * session of the account in **one** transaction.
+   *
+   * The three writes belong together: a session that survived a password
+   * reset is a session that keeps the old credential alive, and a split
+   * write (revoke first, then the password) leaves a window in which a
+   * login in flight creates a session the reset has already passed.
+   *
+   * Returns `applied: false` when the token was already consumed or expired
+   * — in that case nothing was written and no session was revoked.
    */
-  consumePasswordReset(input: ConsumePasswordResetInput): Promise<boolean>;
+  consumePasswordReset(
+    input: ConsumePasswordResetInput,
+  ): Promise<ConsumePasswordResetResult>;
 }

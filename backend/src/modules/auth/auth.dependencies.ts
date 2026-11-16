@@ -48,7 +48,6 @@ export const accountService = new AccountService({
   accounts: new PrismaAccountRepository(),
   institutions,
   roles,
-  sessions,
   sessionStore,
   compromisedPasswords: new LocalCompromisedPasswordChecker(),
 });

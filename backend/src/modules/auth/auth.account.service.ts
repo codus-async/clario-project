@@ -14,10 +14,10 @@ import {
 import type {
   AccountRecord,
   AccountRepository,
+  ConsumePasswordResetResult,
   InstitutionRepository,
   PasswordHasher,
   RoleAssignmentRepository,
-  SessionRepository,
   SessionStore,
 } from "./auth.ports.js";
 import {
@@ -63,7 +63,6 @@ export interface AccountServiceDeps {
   accounts: AccountRepository;
   institutions: InstitutionRepository;
   roles: RoleAssignmentRepository;
-  sessions: SessionRepository;
   sessionStore: SessionStore;
   compromisedPasswords: CompromisedPasswordChecker;
 }
@@ -111,7 +110,6 @@ export class AccountService {
   private readonly accounts: AccountRepository;
   private readonly institutions: InstitutionRepository;
   private readonly roles: RoleAssignmentRepository;
-  private readonly sessions: SessionRepository;
   private readonly sessionStore: SessionStore;
   private readonly compromisedPasswords: CompromisedPasswordChecker;
 
@@ -121,7 +119,6 @@ export class AccountService {
     this.accounts = deps.accounts;
     this.institutions = deps.institutions;
     this.roles = deps.roles;
-    this.sessions = deps.sessions;
     this.sessionStore = deps.sessionStore;
     this.compromisedPasswords = deps.compromisedPasswords;
   }
@@ -250,12 +247,19 @@ export class AccountService {
   /**
    * Completes a password reset (F-64, FR-227).
    *
-   * Ordering matters: the account's sessions are revoked *before* the new
-   * password is stored. If the password write then fails, the account keeps
-   * its old password and the (still unconsumed) token can be used again —
-   * the user is logged out but never left with an old password on a live
-   * session. The reverse order would leave sessions usable with a password
-   * the account holder believes to have abandoned.
+   * The new password and the revocation of every session of the account are
+   * written in one transaction (see `AccountRepository.consumePasswordReset`),
+   * so there is no window in which the old credential is still good:
+   *
+   * - a login that is in flight while the reset commits cannot establish a
+   *   session, because the session row is fenced on the password hash the
+   *   login verified (see `SessionRepository.create`);
+   * - a session row that was written before the reset started is revoked by
+   *   the reset's own transaction.
+   *
+   * The runtime state in Redis is dropped after the transaction commits. A
+   * failure to delete it is not fatal: the next request cross-checks the
+   * Redis state against the revoked row and fails closed.
    */
   async resetPassword(input: PasswordResetInput): Promise<void> {
     const token = this.validateToken(input.token, invalidResetToken);
@@ -280,42 +284,19 @@ export class AccountService {
 
     const passwordHash = await this.hasher.hash(input.password);
 
-    await this.revokeAllSessions(account.id);
-
-    const applied = await this.accounts.consumePasswordReset({
-      userId: account.id,
-      tokenHash,
-      passwordHash,
-      now,
-    });
-    if (!applied) {
-      // The token was consumed by a concurrent request (single-use).
-      throw invalidResetToken();
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Internals
-  // -------------------------------------------------------------------------
-
-  /**
-   * Revokes every session of the account in PostgreSQL (the authoritative
-   * revocation record) and drops the matching runtime state in Redis.
-   *
-   * A failure to delete a runtime state is not fatal: the next request
-   * cross-checks the Redis state against the revoked row and fails closed.
-   */
-  private async revokeAllSessions(userId: UUID): Promise<void> {
-    let revokedSessionIds: UUID[];
+    let result: ConsumePasswordResetResult;
     try {
-      revokedSessionIds = await this.sessions.revokeAllForUser(
-        userId,
-        REVOKE_REASON_PASSWORD_RESET,
-      );
+      result = await this.accounts.consumePasswordReset({
+        userId: account.id,
+        tokenHash,
+        passwordHash,
+        revokeReason: REVOKE_REASON_PASSWORD_RESET,
+        now,
+      });
     } catch (error) {
       baseLogger.error(
         { err: error, module: "auth" },
-        "Failed to revoke sessions after password reset",
+        "Failed to apply the password reset",
       );
       throw new AppError(
         ERROR_CODES.SERVICE_UNAVAILABLE,
@@ -323,7 +304,27 @@ export class AccountService {
       );
     }
 
-    for (const sessionId of revokedSessionIds) {
+    if (!result.applied) {
+      // The token was consumed by a concurrent request (single-use).
+      throw invalidResetToken();
+    }
+
+    await this.dropRuntimeSessionState(result.revokedSessionIds);
+  }
+
+  // -------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------
+
+  /**
+   * Drops the Redis runtime state of the sessions the reset revoked.
+   *
+   * The revoked rows in PostgreSQL are the authoritative record, so a
+   * failure here is logged and carried on: the next request cross-checks
+   * the Redis state against the revoked row and fails closed.
+   */
+  private async dropRuntimeSessionState(sessionIds: UUID[]): Promise<void> {
+    for (const sessionId of sessionIds) {
       try {
         await this.sessionStore.delete(sessionId);
       } catch (error) {
