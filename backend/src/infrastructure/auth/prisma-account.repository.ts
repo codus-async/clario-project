@@ -173,10 +173,12 @@ export class PrismaAccountRepository implements AccountRepository {
 
       // The reset token is a live credential, so it is never stored in
       // clear text: the payload carries the encrypted envelope, and the
-      // relay decrypts it with the same key (the envelope is bound to this
-      // outbox row, so it cannot be copied into another one). The relay
-      // purges the payload after the dispatch — the row itself must never
-      // keep a readable credential.
+      // relay decrypts it with the same key. The envelope is bound to the
+      // account and the event type, not to this row: only a row carrying
+      // the same `aggregate_id` and `event_type` decrypts it, so it cannot
+      // be replayed against another account or another event type. The
+      // relay purges the payload after the dispatch — the row itself must
+      // never keep a readable credential.
       const tokenEnvelope = this.cipher.encrypt(
         input.rawToken,
         `${input.userId}|${PASSWORD_RESET_EVENT_TYPE}`,

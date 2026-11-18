@@ -159,7 +159,10 @@ export class AccountService {
       invitationTokenHash: tokenHash,
       passwordHash,
       mfaRequired,
-      now,
+      // Hashing is slow (Argon2id): the token may have expired while it ran,
+      // so the conditional write is compared against the time it is actually
+      // authorised, not the time the lookup happened.
+      now: new Date(),
     });
     if (!activated) {
       // Another request consumed the invitation in the meantime: the token
@@ -291,7 +294,11 @@ export class AccountService {
         tokenHash,
         passwordHash,
         revokeReason: REVOKE_REASON_PASSWORD_RESET,
-        now,
+        // Hashing is slow (Argon2id): the token may have expired while it
+        // ran, so the conditional write (which also revokes the sessions)
+        // is compared against the time it is actually authorised, not the
+        // time the lookup happened.
+        now: new Date(),
       });
     } catch (error) {
       baseLogger.error(
