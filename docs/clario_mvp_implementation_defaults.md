@@ -172,6 +172,7 @@ The following values must remain configurable:
 - Supervisor assessment deadline
 - Payment provider credentials and settings
 - Email provider credentials and settings
+- Transactional-outbox payload encryption key
 - Grading precision and rounding settings
 - Object-storage bucket names
 - Worker retry and backoff policies
@@ -290,7 +291,9 @@ Tests must cover both successful workflows and authorization, tenant-isolation, 
 - Opaque session IDs in `HttpOnly`, `Secure`, `SameSite` cookies
 - Session state stored in Redis
 - Immediate server-side session revocation on logout
-- All-session revocation after password reset
+- All-session revocation after password reset, applied in the same transaction as the password write
+- Session creation fenced on the verified credential, so a password reset can never leave a session that was authenticated with the old password
+- Secrets carried by transactional-outbox payloads (such as the single-use password-reset token) are stored encrypted (AES-256-GCM) and never in clear text; the relay decrypts them and purges the payload after dispatch
 
 The application must continue to enforce the documented role, tenant, programme, project, assignment, subscription, and MFA policies independently of the session mechanism.
 

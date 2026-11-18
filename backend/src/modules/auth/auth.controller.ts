@@ -20,9 +20,10 @@ import type {
 import { getValidatedBody } from "./auth.validation.js";
 
 /**
- * Login payload. The documented final response mapping (implementation
- * prompt stage "F-64 response") is a later stage; this route returns the
- * session identifier, bound identity, MFA state and inactivity timeout only.
+ * Login payload, mapped to the documented F-64 response contract (REST
+ * contract §2.1): the session identifier, the bound identity — including the
+ * coordinator appointments the account is scoped to — the MFA state and the
+ * inactivity timeout.
  */
 function loginResponse(result: LoginResult): Record<string, unknown> {
   const { state } = result;
@@ -36,6 +37,15 @@ function loginResponse(result: LoginResult): Record<string, unknown> {
       institution_code: state.institutionCode,
       timezone_iana: state.institutionTimezone,
       roles: state.assignedRoles,
+      coordinator_appointments: state.coordinatorAppointments.map(
+        (appointment) => ({
+          appointment_id: appointment.appointmentId,
+          programme_id: appointment.programmeId,
+          programme_name: appointment.programmeName,
+          academic_session_id: appointment.academicSessionId,
+          session_label: appointment.academicSessionLabel,
+        }),
+      ),
     },
     active_role: state.activeRole,
     mfa_required: state.mfaRequired,
@@ -88,6 +98,12 @@ export function createAuthController(deps: AuthControllerDeps): {
       ...SESSION_COOKIE_OPTIONS,
       maxAge: cookieMaxAgeMs,
     });
+    // The login resolves the tenant, so the response carries the
+    // institution's authoritative timezone (REST contract §1.1).
+    res.setHeader(
+      CLARIO_HTTP_HEADERS.INSTITUTION_TIMEZONE,
+      result.state.institutionTimezone,
+    );
     res.status(200).json(loginResponse(result));
   };
 

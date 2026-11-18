@@ -18,26 +18,50 @@ import type { CompromisedPasswordChecker } from "../../modules/auth/auth.passwor
  * 3. consists of a single repeated character, or
  * 4. contains no letters at all (a numeric pattern is not a passphrase).
  *
- * The digit replacements of the leet-speak normalisation only apply to
- * digits that are *not* part of a consecutive run, so the trailing `1234`
- * of `Password1234!` stays a number while the `0` of `P@ssw0rd` becomes an
- * `o`.
+ * The reduction in rule 2 is computed twice: once on the raw password and
+ * once on the leet-normalised password. The normalisation maps the digits
+ * that stand *inside* a word to their letter (`P@ssw0rd` → `password`) and
+ * leaves the digits that form a numeric block alone (`Password2026!` →
+ * `password2026`), so a trailing year does not contaminate the word that
+ * is being compared. A digit block counts as "inside a word" only when it
+ * is surrounded by letters on both sides, which is what makes the run
+ * `55` of `Pa55word2026!` resolve to `ss` while the block `2026` stays a
+ * number.
+ *
+ * Every check is Unicode-aware: a letter is any code point in `\p{L}` and a
+ * digit any code point in `\p{N}`, so a password written in a non-Latin
+ * script is judged on its own letters instead of being mistaken for a
+ * numeric pattern.
  */
 
 /**
- * Leet-speak substitutions. A digit is only replaced when it stands
- * alone: `(?<![0-9])` / `(?![0-9])` keep consecutive digit runs intact.
+ * Leet-speak substitutions for the digits that have a letter look-alike.
+ * The digits without one (`2`, `6`, `8`, `9`) are left alone.
  */
-const LEET_SUBSTITUTIONS: ReadonlyArray<[RegExp, string]> = [
-  [/(?<![0-9])0(?![0-9])/g, "o"],
-  [/(?<![0-9])1(?![0-9])/g, "i"],
-  [/(?<![0-9])3(?![0-9])/g, "e"],
-  [/(?<![0-9])4(?![0-9])/g, "a"],
-  [/(?<![0-9])5(?![0-9])/g, "s"],
-  [/(?<![0-9])7(?![0-9])/g, "t"],
+const LEET_DIGITS: Readonly<Record<string, string>> = {
+  "0": "o",
+  "1": "i",
+  "3": "e",
+  "4": "a",
+  "5": "s",
+  "7": "t",
+};
+
+/**
+ * Symbol look-alikes. They are resolved before the digit blocks are
+ * analysed, so the `@` of `p@55word` counts as the letter that surrounds
+ * the digit run.
+ */
+const LEET_SYMBOLS: ReadonlyArray<[RegExp, string]> = [
   [/@/g, "a"],
   [/\$/g, "s"],
 ];
+
+/** A maximal run of digits. */
+const DIGIT_RUN = /[0-9]+/g;
+
+/** A maximal run of identical digits inside a digit run. */
+const IDENTICAL_DIGIT_RUN = /(\d)\1*/g;
 
 /**
  * Well-known breached passwords in their normalised form. Only the shapes
@@ -217,22 +241,63 @@ const BREACHED_BASE_WORDS: ReadonlySet<string> = new Set([
   "cheese",
 ]);
 
-function applyLeetSubstitutions(password: string): string {
-  let normalized = password.toLowerCase();
-  for (const [pattern, replacement] of LEET_SUBSTITUTIONS) {
+/** True for any Unicode letter. */
+function isLetter(char: string | undefined): boolean {
+  return char !== undefined && /\p{L}/u.test(char);
+}
+
+/**
+ * Resolves the symbol look-alikes (`@` → `a`, `$` → `s`).
+ */
+function applySymbolSubstitutions(value: string): string {
+  let normalized = value;
+  for (const [pattern, replacement] of LEET_SYMBOLS) {
     normalized = normalized.replace(pattern, replacement);
   }
   return normalized;
 }
 
+/**
+ * Maps the digit blocks that sit *inside* a word to their letter
+ * look-alike and leaves the numeric blocks alone.
+ *
+ * A digit block is inside a word when it is surrounded by letters on both
+ * sides: `p455w0rd` → `password` (`455` → `ass`, `0` → `o`), while
+ * `Pa55word2026!` → `password2026!` (`55` → `ss`, `2026` stays a number
+ * because it is not surrounded by letters).
+ *
+ * Inside a block, every maximal run of identical digits is mapped on its
+ * own, so `455` resolves to `a` + `ss` and not to `aaa`.
+ */
+function normalizeDigitBlocks(value: string): string {
+  return value.replace(DIGIT_RUN, (run: string, offset: number) => {
+    const before = offset > 0 ? value[offset - 1] : undefined;
+    const after =
+      offset + run.length < value.length
+        ? value[offset + run.length]
+        : undefined;
+
+    if (!isLetter(before) || !isLetter(after)) {
+      // A numeric block (a year, a counter, a trailing sequence): it is not
+      // part of a word and must not contaminate the word comparison.
+      return run;
+    }
+
+    return run.replace(IDENTICAL_DIGIT_RUN, (subRun: string) => {
+      const letter = LEET_DIGITS[subRun[0] as string];
+      return letter === undefined ? subRun : letter.repeat(subRun.length);
+    });
+  });
+}
+
 /** Keeps the digits and the letters, drops every other character. */
 function alphanumericOnly(value: string): string {
-  return value.replace(/[^a-z0-9]/g, "");
+  return value.replace(/[^\p{L}\p{N}]/gu, "");
 }
 
 /** Keeps the letters only — the "core" of a password. */
 function lettersOnly(value: string): string {
-  return value.replace(/[^a-z]/g, "");
+  return value.replace(/[^\p{L}]/gu, "");
 }
 
 function isSingleRepeatedCharacter(value: string): boolean {
@@ -244,11 +309,14 @@ function isSingleRepeatedCharacter(value: string): boolean {
  */
 export class LocalCompromisedPasswordChecker implements CompromisedPasswordChecker {
   async isCompromised(password: string): Promise<boolean> {
-    const plain = alphanumericOnly(password.toLowerCase());
+    const lowercased = password.toLowerCase();
+    const plain = alphanumericOnly(lowercased);
     if (plain.length === 0) {
       return true;
     }
-    const leet = alphanumericOnly(applyLeetSubstitutions(password));
+    const leet = alphanumericOnly(
+      normalizeDigitBlocks(applySymbolSubstitutions(lowercased)),
+    );
 
     if (BREACHED_PASSWORDS.has(plain) || BREACHED_PASSWORDS.has(leet)) {
       return true;
@@ -266,7 +334,8 @@ export class LocalCompromisedPasswordChecker implements CompromisedPasswordCheck
     }
 
     // A password without a single letter is a numeric pattern, never a
-    // passphrase.
-    return !/[a-z]/.test(plain);
+    // passphrase. The test is Unicode-aware, so a password written in a
+    // non-Latin script still counts as a passphrase.
+    return !/\p{L}/u.test(plain);
   }
 }

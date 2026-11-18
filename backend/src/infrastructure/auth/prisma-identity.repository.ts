@@ -91,6 +91,18 @@ export class PrismaUserRepository implements UserRepository {
     const row = await this.client.users.findUnique({ where: { id: userId } });
     return row === null ? null : toLoginUserRecord(row);
   }
+
+  /**
+   * F-64 §G "Last Authenticated Timestamp". Written on the plain Prisma
+   * client: `users` is deliberately not RLS protected (it is addressed by the
+   * opaque session id and carries the tenant-less Platform Admin rows).
+   */
+  async recordLogin(userId: UUID, at: Date): Promise<void> {
+    await this.client.users.updateMany({
+      where: { id: userId },
+      data: { last_login_at: at },
+    });
+  }
 }
 
 export class PrismaInstitutionRepository implements InstitutionRepository {

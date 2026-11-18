@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { EnvironmentSchema } from "../../config/env.js";
+import {
+  EnvironmentSchema,
+  PAYLOAD_ENCRYPTION_KEY_PLACEHOLDER,
+} from "../../config/env.js";
 
 const validEnv = {
   NODE_ENV: "test",
@@ -9,6 +12,8 @@ const validEnv = {
   DIRECT_URL: "postgresql://user:pass@localhost:5432/clario",
   REDIS_URL: "redis://localhost:6379",
   LOG_LEVEL: "info",
+  OUTBOX_PAYLOAD_ENCRYPTION_KEY:
+    "Y2xhcmlvLWRldi1vbmx5LXBheWxvYWQta2V5LTAwMDA=",
 };
 
 describe("EnvironmentSchema", () => {
@@ -115,6 +120,48 @@ describe("EnvironmentSchema", () => {
       ...validEnv,
       LOGIN_LOCKOUT_BASE_COOLDOWN_MINUTES: "60",
       LOGIN_LOCKOUT_MAX_COOLDOWN_MINUTES: "60",
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a missing outbox payload encryption key", () => {
+    const {
+      OUTBOX_PAYLOAD_ENCRYPTION_KEY: _OUTBOX_PAYLOAD_ENCRYPTION_KEY,
+      ...rest
+    } = validEnv;
+    const result = EnvironmentSchema.safeParse(rest);
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects an outbox payload encryption key that is not 32 bytes", () => {
+    const result = EnvironmentSchema.safeParse({
+      ...validEnv,
+      // 16 bytes — too short for AES-256.
+      OUTBOX_PAYLOAD_ENCRYPTION_KEY:
+        "c2hvcnQta2V5LTAwMDAwMDA=",
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects the development placeholder in production", () => {
+    const result = EnvironmentSchema.safeParse({
+      ...validEnv,
+      NODE_ENV: "production",
+      OUTBOX_PAYLOAD_ENCRYPTION_KEY: PAYLOAD_ENCRYPTION_KEY_PLACEHOLDER,
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a real outbox payload encryption key in production", () => {
+    const result = EnvironmentSchema.safeParse({
+      ...validEnv,
+      NODE_ENV: "production",
+      OUTBOX_PAYLOAD_ENCRYPTION_KEY:
+        "8J3vQ0hZ6dYl0m1kQ2wE5rT7yU9iO4pA6sD8fG0hJ2k=",
     });
 
     expect(result.success).toBe(true);

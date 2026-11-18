@@ -326,6 +326,11 @@ export const CLARIO_HTTP_HEADERS = {
   ACTIVE_ROLE: 'X-Clario-Active-Role',
   COORDINATOR_APPOINTMENT_ID: 'X-Clario-Coordinator-Appointment-Id',
   IDEMPOTENCY_KEY: 'X-Idempotency-Key',
+  /**
+   * Response header carrying the institution's authoritative IANA timezone.
+   * Always returned on tenant routes (REST contract §1.1, BR-NEW-01).
+   */
+  INSTITUTION_TIMEZONE: 'X-Clario-Institution-Timezone',
   REQUEST_ID: 'X-Request-Id',
   WEBHOOK_SIGNATURE: 'X-Payment-Webhook-Signature',
 } as const;

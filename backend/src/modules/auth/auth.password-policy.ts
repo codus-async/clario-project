@@ -10,6 +10,17 @@ import { ERROR_CODES } from "../../errors/error-codes.js";
 export const MIN_PASSWORD_LENGTH = CLARIO_SYSTEM_CONSTANTS.MIN_PASSWORD_LENGTH;
 
 /**
+ * Upper bound of a password that may be stored on an account.
+ *
+ * It is the same bound the login boundary enforces (`MAX_PASSWORD_LENGTH`
+ * in `auth.service.ts`, which re-exports this constant), so a password
+ * that the activation or the password-reset flow accepts can always be
+ * used to sign in again — a longer password would be stored and then
+ * rejected by `/auth/login` for the rest of the account's life.
+ */
+export const MAX_PASSWORD_LENGTH = 1024;
+
+/**
  * Port for the SEC-03 compromised-password screening (FR-220).
  *
  * The implementation is an infrastructure concern: the MVP ships a local
@@ -34,13 +45,25 @@ function tooShortError(): AppError {
 }
 
 /**
- * SEC-03: the password is known to be compromised. It gets its own
- * documented code so the client can distinguish "pick another password"
- * from "your input was malformed".
+ * The password is longer than the login boundary accepts. Reported as a
+ * plain validation failure, for the same reason as {@link tooShortError}.
+ */
+function tooLongError(): AppError {
+  const message = `password must be at most ${String(MAX_PASSWORD_LENGTH)} characters.`;
+  return new AppError(ERROR_CODES.VALIDATION_ERROR, message, [
+    { field: "password", message },
+  ]);
+}
+
+/**
+ * SEC-03: the password is known to be compromised, or it is too weak to be
+ * a passphrase (a single repeated character, or a numeric pattern without
+ * a single letter). It gets its own documented code so the client can
+ * distinguish "pick another password" from "your input was malformed".
  */
 function compromisedError(): AppError {
   const message =
-    "password appears on a known compromised-password list and cannot be used.";
+    "password is too weak or appears on a known compromised-password list and cannot be used.";
   return new AppError(
     ERROR_CODES.COMPROMISED_OR_WEAK_PASSWORD,
     message,
@@ -66,6 +89,10 @@ export async function assertPasswordPolicy(
 ): Promise<void> {
   if (password.length < MIN_PASSWORD_LENGTH) {
     throw tooShortError();
+  }
+
+  if (password.length > MAX_PASSWORD_LENGTH) {
+    throw tooLongError();
   }
 
   if (await compromisedPasswords.isCompromised(password)) {

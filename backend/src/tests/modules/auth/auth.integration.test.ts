@@ -26,6 +26,7 @@ import {
 import { PrismaSessionRepository } from "../../../infrastructure/auth/prisma-session.repository.js";
 import { RedisLoginProtectionStore } from "../../../infrastructure/auth/redis-login-protection.store.js";
 import { RedisSessionStore } from "../../../infrastructure/auth/redis-session.store.js";
+import { PayloadCipher } from "../../../infrastructure/security/payload-cipher.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
 import { createRequireSession } from "../../../modules/auth/auth.middleware.js";
@@ -46,6 +47,13 @@ const POSTGRES_DB = "clario";
 const PASSWORD = "Correct-Horse-Battery-Staple-99!";
 const SUPERVISOR_EMAIL = "tunde.adewale@unilag.edu.ng";
 const COORDINATOR_EMAIL = "coordinator@unilag.edu.ng";
+
+/**
+ * The key the outbox payload is encrypted with in this test. The relay (F-71)
+ * decrypts with the same key.
+ */
+const OUTBOX_KEY = "Y2xhcmlvLWRldi1vbmx5LXBheWxvYWQta2V5LTAwMDA=";
+const PASSWORD_RESET_EVENT_TYPE = "AUTH_PASSWORD_RESET_REQUESTED";
 
 /**
  * Wraps the real Argon2id hasher to observe how many KDF invocations run in
@@ -93,6 +101,8 @@ let app: ReturnType<typeof express>;
 let institutionId: string;
 let supervisorId: string;
 let coordinatorId: string;
+let programmeId: string;
+let academicSessionId: string;
 let appointmentId: string;
 let supervisorPasswordHash: string;
 let countingHasher: CountingPasswordHasher;
@@ -170,14 +180,14 @@ beforeAll(async () => {
      VALUES ($1, $2, $3, 'B.Sc. Computer Science', 'CSC') RETURNING id`,
     [institutionId, facultyId, departmentId],
   );
-  const programmeId = firstRow(programmes.rows).id;
+  programmeId = firstRow(programmes.rows).id;
 
   const academicSessions = await sql.query<{ id: string }>(
     `INSERT INTO academic_sessions (institution_id, session_label, start_date, end_date)
      VALUES ($1, '2026/2027', '2026-09-01', '2027-08-31') RETURNING id`,
     [institutionId],
   );
-  const academicSessionId = firstRow(academicSessions.rows).id;
+  academicSessionId = firstRow(academicSessions.rows).id;
 
   const supervisor = await sql.query<{ id: string }>(
     `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
@@ -236,10 +246,12 @@ beforeAll(async () => {
   const accountService = new AccountService({
     config: testAuthConfig,
     hasher: countingHasher,
-    accounts: new PrismaAccountRepository(db),
+    accounts: new PrismaAccountRepository(
+      db,
+      new PayloadCipher(OUTBOX_KEY),
+    ),
     institutions: new PrismaInstitutionRepository(db),
     roles: new PrismaRoleAssignmentRepository(db),
-    sessions: new PrismaSessionRepository(db),
     sessionStore: new RedisSessionStore(redis),
     compromisedPasswords: new LocalCompromisedPasswordChecker(),
   });
@@ -292,7 +304,116 @@ function cookieFrom(response: request.Response): string {
   return headers[0]?.split(";")[0] ?? "";
 }
 
+/**
+ * Rewrites the stored runtime session state, keeping its TTL. It simulates the
+ * passage of time without waiting for it: the expiry tests move the absolute
+ * deadline or the last-activity timestamp into the past.
+ */
+async function patchRedisSession(
+  sessionId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const key = `clario:session:${sessionId}`;
+  const raw = await redis.get(key);
+  expect(raw).not.toBeNull();
+  const state = JSON.parse(String(raw)) as Record<string, unknown>;
+  const ttl = await redis.ttl(key);
+  await redis.set(
+    key,
+    JSON.stringify({ ...state, ...patch }),
+    "EX",
+    Math.max(1, ttl),
+  );
+}
+
+/**
+ * The fields the REST contract (§2.1) requires on a login response. The
+ * implementation returns a few additional convenience fields
+ * (`active_role`, `expires_at_utc`), so the contract is asserted as a
+ * superset rather than an exact key set.
+ */
+const DOCUMENTED_LOGIN_FIELDS = [
+  "session_id",
+  "user",
+  "mfa_required",
+  "mfa_enrolled",
+  "mfa_verified",
+  "next_step",
+  "inactivity_timeout_minutes",
+];
+
+const DOCUMENTED_LOGIN_USER_FIELDS = [
+  "id",
+  "full_name",
+  "institution_id",
+  "institution_code",
+  "timezone_iana",
+  "roles",
+  "coordinator_appointments",
+];
+
 describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
+  it("records the last authenticated timestamp of the account", async () => {
+    const before = await db.users.findUnique({ where: { id: supervisorId } });
+    expect(before?.last_login_at).toBeNull();
+
+    const response = await login(SUPERVISOR_EMAIL);
+    expect(response.status).toBe(200);
+
+    const after = await db.users.findUnique({ where: { id: supervisorId } });
+    expect(after?.last_login_at).not.toBeNull();
+    expect(after?.last_login_at?.getTime()).toBeGreaterThan(
+      (before?.last_login_at?.getTime() ?? 0) - 1,
+    );
+  }, 120_000);
+
+  it("returns the documented login envelope and the institution timezone header", async () => {
+    const response = await login(COORDINATOR_EMAIL);
+    expect(response.status).toBe(200);
+
+    for (const field of DOCUMENTED_LOGIN_FIELDS) {
+      expect(response.body).toHaveProperty(field);
+    }
+    for (const field of DOCUMENTED_LOGIN_USER_FIELDS) {
+      expect(response.body.user).toHaveProperty(field);
+    }
+
+    expect(response.body.user).toEqual({
+      id: coordinatorId,
+      full_name: "Prof. Grace Okafor",
+      institution_id: institutionId,
+      institution_code: "TENA",
+      timezone_iana: "Africa/Lagos",
+      roles: [RoleCode.PROJECT_COORDINATOR],
+      coordinator_appointments: [
+        {
+          appointment_id: appointmentId,
+          programme_id: programmeId,
+          programme_name: "B.Sc. Computer Science",
+          academic_session_id: academicSessionId,
+          session_label: "2026/2027",
+        },
+      ],
+    });
+
+    // A Project Coordinator is a mandatory-MFA role (SEC-06): the session
+    // exists but has no full access until the challenge is completed.
+    expect(response.body.mfa_required).toBe(true);
+    expect(response.body.mfa_enrolled).toBe(false);
+    expect(response.body.mfa_verified).toBe(false);
+    expect(response.body.next_step).toBe("MFA_CHALLENGE_REQUIRED");
+    expect(response.body.inactivity_timeout_minutes).toBe(30);
+
+    // The tenant's authoritative timezone travels with the response.
+    expect(response.headers["x-clario-institution-timezone"]).toBe(
+      "Africa/Lagos",
+    );
+
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("Cookie", cookieFrom(response));
+  }, 120_000);
+
   it("logs in, authenticates, heartbeats and logs out", async () => {
     const loginResponse = await login(SUPERVISOR_EMAIL);
     expect(loginResponse.status).toBe(200);
@@ -312,6 +433,13 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     expect(row?.is_revoked).toBe(false);
     expect(row?.mfa_verified).toBe(false);
     expect(row?.inactivity_timeout_minutes).toBe(60);
+    // Creation, heartbeat and expiry timestamps are all persisted.
+    expect(row?.created_at).toBeInstanceOf(Date);
+    expect(row?.last_activity_at).toBeInstanceOf(Date);
+    expect(row?.expires_at).toBeInstanceOf(Date);
+    const createdAt = row?.created_at.getTime() ?? 0;
+    expect(row?.last_activity_at.getTime()).toBe(createdAt);
+    expect(row?.expires_at.getTime()).toBeGreaterThan(createdAt);
 
     const redisState = await redis.get(`clario:session:${sessionId}`);
     expect(redisState).not.toBeNull();
@@ -462,6 +590,52 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     const response = await request(app).get("/protected").set("Cookie", cookie);
     expect(response.status).toBe(401);
     expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+  }, 120_000);
+
+  it("rejects a session whose absolute lifetime elapsed", async () => {
+    const loginResponse = await login(SUPERVISOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    // Move the absolute deadline into the past, exactly as the passage of
+    // time would have done.
+    await patchRedisSession(sessionId, {
+      expiresAtUtc: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    // The PostgreSQL audit record records the expiry and the runtime state
+    // is dropped.
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("SESSION_EXPIRED");
+    expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
+  }, 120_000);
+
+  it("rejects a session whose inactivity window elapsed", async () => {
+    const loginResponse = await login(SUPERVISOR_EMAIL);
+    expect(loginResponse.status).toBe(200);
+    const cookie = cookieFrom(loginResponse);
+    const sessionId = String(loginResponse.body.session_id);
+
+    // A supervisor session has a 60 minute inactivity timeout: push the last
+    // activity just beyond it.
+    await patchRedisSession(sessionId, {
+      lastActivityAtUtc: new Date(Date.now() - 61 * 60_000).toISOString(),
+    });
+
+    const response = await request(app).get("/protected").set("Cookie", cookie);
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("SESSION_EXPIRED_OR_REVOKED");
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.is_revoked).toBe(true);
+    expect(row?.revoked_reason).toBe("SESSION_INACTIVITY_TIMEOUT");
     expect(await redis.get(`clario:session:${sessionId}`)).toBeNull();
   }, 120_000);
 
@@ -715,6 +889,51 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
   const INVITED_EMAIL = "invited.student@tena.edu.ng";
   const RESET_EMAIL = "reset.student@tena.edu.ng";
 
+  it("does not create a session row for a credential that changed", async () => {
+    // The session row is fenced on the password hash the login verified: a
+    // password reset that landed in the meantime changes the hash, so the
+    // session must not be created.
+    const user = await sql.query<{ id: string }>(
+      `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
+       VALUES ($1, false, 'Fence Check', $2, 'TENA/STU/9003', 'ACTIVE', $3)
+       RETURNING id`,
+      [institutionId, "fence.student@tena.edu.ng", supervisorPasswordHash],
+    );
+    const userId = firstRow(user.rows).id;
+
+    const sessions = new PrismaSessionRepository(db);
+    const row = {
+      id: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      userId,
+      institutionId,
+      activeRole: RoleCode.STUDENT,
+      activeCoordinatorAppointmentId: null,
+      mfaVerified: false,
+      ipAddress: null,
+      userAgent: null,
+      inactivityTimeoutMinutes: 60,
+      createdAt: new Date(),
+      lastActivityAt: new Date(),
+      expiresAt: new Date(Date.now() + 60 * 60_000),
+    };
+
+    const stale = await sessions.create(row, {
+      passwordHash: "a-stale-password-hash",
+    });
+    expect(stale.created).toBe(false);
+    expect(
+      await db.user_sessions.findUnique({ where: { id: row.id } }),
+    ).toBeNull();
+
+    // The current hash passes the fence.
+    const current = await sessions.create(row, {
+      passwordHash: supervisorPasswordHash,
+    });
+    expect(current.created).toBe(true);
+
+    await db.user_sessions.delete({ where: { id: row.id } });
+  }, 60_000);
+
   it("activates an invited account exactly once", async () => {
     const token = "invitation-token-for-integration";
     const tokenHash = hashSingleUseToken(token);
@@ -786,27 +1005,38 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
 
     // The delivery request is recorded in the transactional outbox.
     const outbox = await db.transactional_outbox_events.findFirst({
-      where: { aggregate_id: userId, event_type: "AUTH_PASSWORD_RESET_REQUESTED" },
+      where: { aggregate_id: userId, event_type: PASSWORD_RESET_EVENT_TYPE },
     });
     expect(outbox).not.toBeNull();
     expect(outbox?.processed).toBe(false);
 
     const payload = outbox?.payload_jsonb as {
-      token: string;
+      token_encrypted: string;
       email: string;
     };
     expect(payload.email).toBe(RESET_EMAIL);
 
+    // The raw token is never stored: the payload carries the encrypted
+    // envelope, and the relay decrypts it with the application key.
+    expect(payload).not.toHaveProperty("token");
+    const rawToken = new PayloadCipher(OUTBOX_KEY).decrypt(
+      payload.token_encrypted,
+      `${userId}|${PASSWORD_RESET_EVENT_TYPE}`,
+    );
+    expect(rawToken.length).toBeGreaterThan(0);
+    // The stored row holds no clear-text credential.
+    expect(JSON.stringify(payload)).not.toContain(rawToken);
+
     // Only the digest of the token is stored on the account.
     const withToken = await db.users.findUnique({ where: { id: userId } });
     expect(withToken?.password_reset_token_hash).toBe(
-      hashSingleUseToken(payload.token),
+      hashSingleUseToken(rawToken),
     );
     expect(withToken?.password_reset_expires_at).not.toBeNull();
 
     const reset = await request(app)
       .post("/api/v1/auth/password/reset")
-      .send({ token: payload.token, password: "Brand-New-Strong-Pass-77!" });
+      .send({ token: rawToken, password: "Brand-New-Strong-Pass-77!" });
     expect(reset.status).toBe(200);
 
     const afterReset = await db.users.findUnique({ where: { id: userId } });
@@ -825,7 +1055,7 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
     // The token cannot be replayed.
     const replay = await request(app)
       .post("/api/v1/auth/password/reset")
-      .send({ token: payload.token, password: "Another-Strong-Pass-88!" });
+      .send({ token: rawToken, password: "Another-Strong-Pass-88!" });
     expect(replay.status).toBe(400);
     expect(replay.body.error.code).toBe("VALIDATION_ERROR");
   }, 120_000);

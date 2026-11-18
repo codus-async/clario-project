@@ -1,15 +1,18 @@
 import type { UUID } from "@clario/shared-contracts";
 
+import { env } from "../../config/env.js";
 import {
   Prisma,
   type PrismaClient,
 } from "../../generated/prisma/client.js";
 import { prisma } from "../database/prisma.js";
+import { PayloadCipher } from "../security/payload-cipher.js";
 import type {
   AccountRecord,
   AccountRepository,
   ActivateAccountInput,
   ConsumePasswordResetInput,
+  ConsumePasswordResetResult,
   IssuePasswordResetInput,
 } from "../../modules/auth/auth.ports.js";
 
@@ -61,12 +64,24 @@ function toAccountRecord(row: AccountRow): AccountRecord {
  * `coordinator_appointments`) are *not* touched here; they are read through
  * the institution-scoped RLS transaction by
  * `PrismaRoleAssignmentRepository`.
+ *
+ * The password reset spans two tables (`users` and `user_sessions`), so this
+ * adapter also performs the bulk session revocation of a reset: the write
+ * of the new password and the revocation of the account's sessions have to
+ * be a single transaction, and they belong to one credential change.
  */
 export class PrismaAccountRepository implements AccountRepository {
   private readonly client: PrismaClient;
+  private readonly cipher: PayloadCipher;
 
-  constructor(client: PrismaClient = prisma) {
+  constructor(
+    client: PrismaClient = prisma,
+    cipher: PayloadCipher = new PayloadCipher(
+      env.OUTBOX_PAYLOAD_ENCRYPTION_KEY,
+    ),
+  ) {
     this.client = client;
+    this.cipher = cipher;
   }
 
   async findByInvitationTokenHash(
@@ -156,6 +171,17 @@ export class PrismaAccountRepository implements AccountRepository {
         return;
       }
 
+      // The reset token is a live credential, so it is never stored in
+      // clear text: the payload carries the encrypted envelope, and the
+      // relay decrypts it with the same key (the envelope is bound to this
+      // outbox row, so it cannot be copied into another one). The relay
+      // purges the payload after the dispatch — the row itself must never
+      // keep a readable credential.
+      const tokenEnvelope = this.cipher.encrypt(
+        input.rawToken,
+        `${input.userId}|${PASSWORD_RESET_EVENT_TYPE}`,
+      );
+
       await tx.transactional_outbox_events.create({
         data: {
           institution_id: input.institutionId,
@@ -165,7 +191,7 @@ export class PrismaAccountRepository implements AccountRepository {
           payload_jsonb: {
             email: input.email,
             full_name: input.fullName,
-            token: input.rawToken,
+            token_encrypted: tokenEnvelope,
             expires_at_utc: input.expiresAt.toISOString(),
           } satisfies Prisma.InputJsonObject,
         },
@@ -173,23 +199,49 @@ export class PrismaAccountRepository implements AccountRepository {
     });
   }
 
+  /**
+   * Applies the new password, clears the reset token and revokes every
+   * session of the account in one transaction.
+   *
+   * The revocation belongs to the same transaction as the password write:
+   * a session that survives a password reset is a session that keeps the
+   * old credential usable, and splitting the two writes opens a window in
+   * which a login in flight creates a session the reset has already passed.
+   */
   async consumePasswordReset(
     input: ConsumePasswordResetInput,
-  ): Promise<boolean> {
-    const result = await this.client.users.updateMany({
-      where: {
-        id: input.userId,
-        password_reset_token_hash: input.tokenHash,
-        password_reset_expires_at: { gt: input.now },
-      },
-      data: {
-        password_hash: input.passwordHash,
-        password_reset_token_hash: null,
-        password_reset_expires_at: null,
-        updated_at: input.now,
-      },
-    });
+  ): Promise<ConsumePasswordResetResult> {
+    return this.client.$transaction(async (tx) => {
+      const updated = await tx.users.updateMany({
+        where: {
+          id: input.userId,
+          password_reset_token_hash: input.tokenHash,
+          password_reset_expires_at: { gt: input.now },
+        },
+        data: {
+          password_hash: input.passwordHash,
+          password_reset_token_hash: null,
+          password_reset_expires_at: null,
+          updated_at: input.now,
+        },
+      });
 
-    return result.count > 0;
+      if (updated.count === 0) {
+        // The token was consumed (or expired) in the meantime: nothing is
+        // written and no session is revoked.
+        return { applied: false, revokedSessionIds: [] };
+      }
+
+      const revoked = await tx.user_sessions.updateManyAndReturn({
+        where: { user_id: input.userId, is_revoked: false },
+        data: { is_revoked: true, revoked_reason: input.revokeReason },
+        select: { id: true },
+      });
+
+      return {
+        applied: true,
+        revokedSessionIds: revoked.map((row) => row.id),
+      };
+    });
   }
 }

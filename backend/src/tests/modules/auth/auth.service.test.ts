@@ -6,6 +6,7 @@ import { ERROR_CODES } from "../../../errors/error-codes.js";
 import {
   LOGIN_PAYLOAD,
   PASSWORD,
+  USER_ID,
   coordinatorScope,
   createFakeAuthFixture,
   seedCoordinatorScopes,
@@ -70,6 +71,31 @@ describe("AuthService.login", () => {
     expect(fixture.sessionStore.states.has(result.sessionId)).toBe(true);
     expect(fixture.protection.successes).toHaveLength(1);
     expect(fixture.protection.failures).toHaveLength(0);
+  });
+
+  it("records the last authenticated timestamp of the account", async () => {
+    const fixture = seededFixture();
+
+    const result = await fixture.service.login(LOGIN_PAYLOAD);
+
+    const lastLoginAt = fixture.users.lastLoginAt.get(USER_ID);
+    expect(lastLoginAt).toBeInstanceOf(Date);
+    expect(lastLoginAt?.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(result.state.createdAtUtc).toBe(
+      (lastLoginAt as Date).toISOString(),
+    );
+  });
+
+  it("keeps the login successful when the last authenticated timestamp cannot be written", async () => {
+    const fixture = seededFixture();
+    fixture.users.recordLoginShouldFail = true;
+
+    const result = await fixture.service.login(LOGIN_PAYLOAD);
+
+    // A bookkeeping failure must never invalidate an established session.
+    expect(result.state.activeRole).toBe(RoleCode.PROJECT_SUPERVISOR);
+    expect(fixture.sessions.rows.get(result.sessionId)?.isRevoked).toBe(false);
+    expect(fixture.sessionStore.states.has(result.sessionId)).toBe(true);
   });
 
   it("computes the absolute expiry and a bounded redis ttl", async () => {
@@ -434,6 +460,23 @@ describe("AuthService.login", () => {
       () => fixture.service.login(LOGIN_PAYLOAD),
       ERROR_CODES.SERVICE_UNAVAILABLE,
     );
+    expect(fixture.sessionStore.states.size).toBe(0);
+  });
+
+  it("refuses to establish a session when the credential changed under the login", async () => {
+    // A password reset that lands while the login is in flight revokes
+    // every session of the account. The session row is fenced on the
+    // password hash that was verified, so the login must not establish a
+    // session with the old credential.
+    const fixture = seededFixture();
+    fixture.sessions.credentialHashOf = () => "a-different-password-hash";
+
+    await expectAppError(
+      () => fixture.service.login(LOGIN_PAYLOAD),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+
+    expect(fixture.sessions.rows.size).toBe(0);
     expect(fixture.sessionStore.states.size).toBe(0);
   });
 

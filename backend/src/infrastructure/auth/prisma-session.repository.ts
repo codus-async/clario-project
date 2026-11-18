@@ -4,6 +4,8 @@ import type { PrismaClient } from "../../generated/prisma/client.js";
 import { prisma } from "../database/prisma.js";
 import type {
   NewSessionRow,
+  SessionCreationResult,
+  SessionCredentialFence,
   SessionRecord,
   SessionRepository,
 } from "../../modules/auth/auth.ports.js";
@@ -49,22 +51,59 @@ export class PrismaSessionRepository implements SessionRepository {
     this.client = client;
   }
 
-  async create(row: NewSessionRow): Promise<void> {
-    await this.client.user_sessions.create({
-      data: {
-        id: row.id,
-        user_id: row.userId,
-        institution_id: row.institutionId,
-        active_role: row.activeRole,
-        active_coordinator_appointment_id:
-          row.activeCoordinatorAppointmentId,
-        mfa_verified: row.mfaVerified,
-        ip_address: row.ipAddress,
-        user_agent: row.userAgent,
-        inactivity_timeout_minutes: row.inactivityTimeoutMinutes,
-        last_activity_at: row.lastActivityAt,
-        expires_at: row.expiresAt,
-      },
+  /**
+   * Creates the session row, fenced on the credential the login verified.
+   *
+   * The row is written inside a transaction that first locks the account row
+   * (`SELECT ... FOR UPDATE`) and only proceeds while the account still
+   * carries that exact password hash:
+   *
+   * - a password reset that already committed changed the hash, so the
+   *   locked row no longer matches and no session is created;
+   * - a password reset that is still running holds the row lock, so this
+   *   transaction waits for it; the reset then revokes the sessions of the
+   *   account in its own transaction and the (re-checked) hash no longer
+   *   matches, so no session is created either.
+   *
+   * Either way a password reset can never leave a live session behind that
+   * was authenticated with the old password.
+   */
+  async create(
+    row: NewSessionRow,
+    fence: SessionCredentialFence,
+  ): Promise<SessionCreationResult> {
+    return this.client.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM users
+        WHERE id = ${row.userId}::uuid
+          AND password_hash = ${fence.passwordHash}
+        FOR UPDATE
+      `;
+
+      if (locked.length === 0) {
+        // The credential changed (or the account is gone): no session.
+        return { created: false, reason: "CREDENTIAL_CHANGED" } as const;
+      }
+
+      await tx.user_sessions.create({
+        data: {
+          id: row.id,
+          user_id: row.userId,
+          institution_id: row.institutionId,
+          active_role: row.activeRole,
+          active_coordinator_appointment_id:
+            row.activeCoordinatorAppointmentId,
+          mfa_verified: row.mfaVerified,
+          ip_address: row.ipAddress,
+          user_agent: row.userAgent,
+          inactivity_timeout_minutes: row.inactivityTimeoutMinutes,
+          created_at: row.createdAt,
+          last_activity_at: row.lastActivityAt,
+          expires_at: row.expiresAt,
+        },
+      });
+
+      return { created: true } as const;
     });
   }
 
@@ -80,21 +119,6 @@ export class PrismaSessionRepository implements SessionRepository {
       where: { id: sessionId, is_revoked: false },
       data: { is_revoked: true, revoked_reason: reason },
     });
-  }
-
-  /**
-   * Revokes every live session of an account and returns their ids, so the
-   * caller can also drop the matching Redis runtime state (F-64 password
-   * reset revokes *all* sessions of the account).
-   */
-  async revokeAllForUser(userId: UUID, reason: string): Promise<UUID[]> {
-    const rows = await this.client.user_sessions.updateManyAndReturn({
-      where: { user_id: userId, is_revoked: false },
-      data: { is_revoked: true, revoked_reason: reason },
-      select: { id: true },
-    });
-
-    return rows.map((row) => row.id);
   }
 
   async touchActivity(sessionId: UUID, at: Date): Promise<void> {
