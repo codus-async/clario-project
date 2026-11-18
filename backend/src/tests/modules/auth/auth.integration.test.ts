@@ -357,14 +357,18 @@ describe("F-64 end-to-end (PostgreSQL + Redis)", () => {
     const before = await db.users.findUnique({ where: { id: supervisorId } });
     expect(before?.last_login_at).toBeNull();
 
+    const startedAt = Date.now();
     const response = await login(SUPERVISOR_EMAIL);
     expect(response.status).toBe(200);
+    const finishedAt = Date.now();
 
     const after = await db.users.findUnique({ where: { id: supervisorId } });
     expect(after?.last_login_at).not.toBeNull();
-    expect(after?.last_login_at?.getTime()).toBeGreaterThan(
-      (before?.last_login_at?.getTime() ?? 0) - 1,
-    );
+    // The login writes this value itself, so it must fall inside the window
+    // the request took: an epoch, stale or future timestamp fails.
+    const recordedAt = after?.last_login_at?.getTime() ?? 0;
+    expect(recordedAt).toBeGreaterThanOrEqual(startedAt);
+    expect(recordedAt).toBeLessThanOrEqual(finishedAt);
   }, 120_000);
 
   it("returns the documented login envelope and the institution timezone header", async () => {

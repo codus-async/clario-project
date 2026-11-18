@@ -18,10 +18,13 @@ import {
  * (`OUTBOX_PAYLOAD_ENCRYPTION_KEY`). GCM is authenticated, so a tampered
  * payload fails to decrypt instead of yielding a corrupted token.
  *
- * The *additional authenticated data* binds a ciphertext to the row that owns
- * it: a payload copied from one outbox row into another no longer decrypts.
- * The relay therefore has to decrypt with the same `aggregate_id` /
- * `event_type` pair it read from the row.
+ * The *additional authenticated data* binds a ciphertext to the account and
+ * event type it was issued for — the `aggregate_id` / `event_type` pair the
+ * caller passes in. A payload copied into another account's row, or into a
+ * row of a different event type, no longer decrypts. It is deliberately not
+ * a per-row binding: any row of the same account with the same event type
+ * decrypts the envelope, so the relay reads that pair from the row it
+ * dispatches rather than expecting a row-unique key.
  *
  * The envelope is self-describing so the format can be rotated later:
  *

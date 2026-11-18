@@ -25,7 +25,7 @@ describe("PayloadCipher", () => {
     expect(cipher.encrypt("token", AAD)).not.toBe(cipher.encrypt("token", AAD));
   });
 
-  it("refuses a payload that was encrypted for another row", () => {
+  it("refuses a payload that was encrypted for another account", () => {
     const cipher = new PayloadCipher(KEY);
     const envelope = cipher.encrypt("token", AAD);
 
