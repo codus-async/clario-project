@@ -111,7 +111,13 @@ pnpm --filter backend test
 
 ## 7. Prisma and schema (easy to get wrong)
 
-- Always use the `prisma7` scripts: `pnpm --filter backend db:generate | db:migrate:dev | db:validate | db:studio`. They pass `--config prisma7.config.ts`, which loads the root `.env`. The plain `prisma` binary is v8 RC and only used by `postinstall: prisma skills sync` (non-fatal, `|| exit 0`) — don't mix the two.
+- Always use the `prisma7` scripts — run each one on its own, with its own `pnpm --filter backend` prefix (a `|` chain is read by the shell as a pipeline, not as a list of scripts). They pass `--config prisma7.config.ts`, which loads the root `.env`:
+  - `pnpm --filter backend db:generate` — regenerate the committed client
+  - `pnpm --filter backend db:migrate:dev` — create/apply a dev migration
+  - `pnpm --filter backend db:validate` — validate the schema
+  - `pnpm --filter backend db:studio` — open Prisma Studio
+
+  The plain `prisma` binary is v8 RC and only used by `postinstall: prisma skills sync` (non-fatal, `|| exit 0`) — don't mix the two.
 - The generated client is **committed** at `backend/src/generated/prisma` (unlike `dist/`, which is gitignored). Run `db:generate` after every schema change and commit the regenerated files.
 - `docs/clario_mvp_schema.sql` is the authoritative physical schema. `tenant-isolation.test.ts` enforces that Prisma migrations match it: exactly **44 tables, 90 indexes, 7 triggers**, RLS `tenant_isolation_policy` forced on every tenant table, and `prisma7 migrate diff` reporting `No difference detected`. Any schema change therefore needs all of: `prisma/schema.prisma` edit, new migration, `docs/clario_mvp_schema.sql` kept in sync, `db:generate`, and the counts above updated if tables/indexes/triggers change.
 

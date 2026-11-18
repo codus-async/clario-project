@@ -1,5 +1,5 @@
 import { RoleCode } from "@clario/shared-contracts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { AppError } from "../../../errors/app-error.js";
 import { ERROR_CODES } from "../../../errors/error-codes.js";
@@ -203,6 +203,42 @@ describe("AccountService.activate", () => {
     });
 
     expect(result.mfaRequired).toBe(true);
+  });
+
+  it("rejects an invitation token that expires while the password is hashed", async () => {
+    const start = new Date("2026-03-04T09:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+
+    try {
+      const fixture = fixtureWithAccount({
+        invitationExpiresAt: new Date(start.getTime() + 1_000),
+      });
+
+      // Argon2id takes long enough for the token to expire while it runs; the
+      // fake hasher reproduces that by moving the clock past the expiry.
+      fixture.hasher.hash = async (plain: string) => {
+        vi.setSystemTime(new Date(start.getTime() + 5_000));
+        return `fake-argon2id$${plain}`;
+      };
+
+      const error = await expectAppError(
+        () =>
+          fixture.accountService.activate({
+            token: INVITATION_TOKEN,
+            password: NEW_PASSWORD,
+          }),
+        ERROR_CODES.VALIDATION_ERROR,
+      );
+      expect(error.fieldErrors?.[0]?.field).toBe("token");
+
+      // The conditional write was compared against the time it actually ran,
+      // not the time the lookup happened: nothing was activated.
+      expect(fixture.accounts.accounts[0]?.accountStatus).toBe("INVITED");
+      expect(fixture.accounts.accounts[0]?.passwordHash).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -447,5 +483,69 @@ describe("AccountService.resetPassword", () => {
     expect(fixture.accounts.accounts[0]?.passwordResetTokenHash).toBe(
       hashSingleUseToken(PASSWORD_RESET_TOKEN),
     );
+  });
+
+  it("rejects a reset token that expires while the password is hashed", async () => {
+    const start = new Date("2026-03-04T09:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+
+    try {
+      const fixture = fixtureWithAccount({
+        accountStatus: "ACTIVE",
+        passwordHash: `fake-argon2id$${PASSWORD}`,
+        passwordResetTokenHash: hashSingleUseToken(PASSWORD_RESET_TOKEN),
+        passwordResetExpiresAt: new Date(start.getTime() + 1_000),
+      });
+      // The login path reads the same `users` row, so the account is seeded
+      // there as well: the session fence is checked against it.
+      seedTenantUser(fixture);
+      const userId = fixture.accounts.accounts[0]?.id as string;
+      await fixture.sessions.create(
+        {
+          id: "session-live",
+          userId,
+          institutionId: fixture.accounts.accounts[0]?.institutionId ?? null,
+          activeRole: RoleCode.STUDENT,
+          activeCoordinatorAppointmentId: null,
+          mfaVerified: false,
+          ipAddress: null,
+          userAgent: null,
+          inactivityTimeoutMinutes: 60,
+          createdAt: new Date(),
+          lastActivityAt: new Date(),
+          expiresAt: new Date(start.getTime() + 60 * 60_000),
+        },
+        { passwordHash: `fake-argon2id$${PASSWORD}` },
+      );
+
+      // Argon2id takes long enough for the token to expire while it runs; the
+      // fake hasher reproduces that by moving the clock past the expiry.
+      fixture.hasher.hash = async (plain: string) => {
+        vi.setSystemTime(new Date(start.getTime() + 5_000));
+        return `fake-argon2id$${plain}`;
+      };
+
+      await expectAppError(
+        () =>
+          fixture.accountService.resetPassword({
+            token: PASSWORD_RESET_TOKEN,
+            password: NEW_PASSWORD,
+          }),
+        ERROR_CODES.VALIDATION_ERROR,
+      );
+
+      // The conditional write — the one that also revokes the sessions —
+      // was compared against the time it actually ran: nothing applied.
+      expect(fixture.accounts.accounts[0]?.passwordHash).toBe(
+        `fake-argon2id$${PASSWORD}`,
+      );
+      expect(fixture.accounts.accounts[0]?.passwordResetTokenHash).toBe(
+        hashSingleUseToken(PASSWORD_RESET_TOKEN),
+      );
+      expect(fixture.sessions.rows.get("session-live")?.isRevoked).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
