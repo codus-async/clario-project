@@ -127,6 +127,18 @@ export type SessionCreationResult =
   | { created: true }
   | { created: false; reason: "CREDENTIAL_CHANGED" };
 
+/**
+ * Mutable, documented fields of a live session row that F-65 rewrites after
+ * login: the MFA upgrade of `/auth/mfa/verify` and the active-role /
+ * coordinator-scope switch of `/auth/session/context` (FR-225).
+ */
+export interface SessionContextPatch {
+  activeRole?: RoleCode;
+  activeCoordinatorAppointmentId?: string | null;
+  mfaVerified?: boolean;
+  inactivityTimeoutMinutes?: number;
+}
+
 export interface SessionRepository {
   /**
    * Creates the session row, fenced on the credential it was authenticated
@@ -142,6 +154,17 @@ export interface SessionRepository {
   findById(sessionId: UUID): Promise<SessionRecord | null>;
   markRevoked(sessionId: UUID, reason: string): Promise<void>;
   touchActivity(sessionId: UUID, at: Date): Promise<void>;
+  /**
+   * Applies an F-65 context patch to a live (non-revoked) session row and
+   * reports whether the row existed. The runtime state in Redis and this
+   * row are cross-checked on every request, so the two writes must land
+   * together — see `AuthService.updateSessionContext` /
+   * `AuthService.verifyMfa` for the compensating revert.
+   */
+  updateContext(
+    sessionId: UUID,
+    patch: SessionContextPatch,
+  ): Promise<boolean>;
 }
 
 export interface SessionStore {
@@ -303,4 +326,61 @@ export interface AccountRepository {
   consumePasswordReset(
     input: ConsumePasswordResetInput,
   ): Promise<ConsumePasswordResetResult>;
+}
+
+// ---------------------------------------------------------------------------
+// F-65 multi-factor authentication persistence (SEC-06, FR-224)
+// ---------------------------------------------------------------------------
+
+/**
+ * The MFA material of an account as the application service sees it.
+ *
+ * The TOTP seed is stored encrypted (`users.mfa_secret_encrypted`) and is
+ * decrypted by the adapter, so the plaintext secret exists only inside a
+ * single verification. The ten recovery codes are stored as SHA-256
+ * digests (`users.mfa_recovery_codes_hash`) and never leave the adapter.
+ */
+export interface MfaEnrollmentState {
+  enrolled: boolean;
+  /**
+   * Decrypted base32 TOTP seed. `null` when the account has not enrolled
+   * *or* the stored envelope cannot be decrypted — the service treats the
+   * latter as a service failure, never as a successful verification.
+   */
+  secret: string | null;
+}
+
+export interface EnrollMfaInput {
+  userId: UUID;
+  /** Plaintext base32 TOTP seed; the adapter encrypts it before storage. */
+  secret: string;
+  /** SHA-256 hex digests of the ten single-use recovery codes. */
+  recoveryCodeHashes: string[];
+  now: Date;
+}
+
+export interface MfaRepository {
+  /** Reads the enrollment state of an account (decrypting the seed). */
+  findEnrollment(userId: UUID): Promise<MfaEnrollmentState>;
+  /**
+   * Stores a fresh enrollment — encrypted seed, recovery-code digests and
+   * `mfa_enrolled = true` — in one write. Returns `false` when the account
+   * row no longer exists or is no longer active, so the service can fail
+   * instead of handing out codes for an account that is gone.
+   */
+  enroll(input: EnrollMfaInput): Promise<boolean>;
+  /**
+   * Removes one recovery-code digest with a conditional write. Returns
+   * `true` only for the caller that consumed a still-unused code: two
+   * concurrent submissions of the same code cannot both succeed, because
+   * the second write no longer matches the value it read (single-use is
+   * database-enforced, FR-224).
+   */
+  consumeRecoveryCode(
+    userId: UUID,
+    codeDigest: string,
+    now: Date,
+  ): Promise<boolean>;
+  /** Number of recovery codes the account still has unused. */
+  countRecoveryCodes(userId: UUID): Promise<number>;
 }

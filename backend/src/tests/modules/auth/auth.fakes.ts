@@ -17,15 +17,19 @@ import type {
   ActivateAccountInput,
   ConsumePasswordResetInput,
   ConsumePasswordResetResult,
+  EnrollMfaInput,
   InstitutionRecord,
   InstitutionRepository,
   IssuePasswordResetInput,
   LoginProtectionStore,
   LoginUserRecord,
+  MfaEnrollmentState,
+  MfaRepository,
   NewSessionRow,
   PasswordHasher,
   ProtectionCheckResult,
   RoleAssignmentRepository,
+  SessionContextPatch,
   SessionCreationResult,
   SessionCredentialFence,
   SessionRecord,
@@ -163,6 +167,7 @@ export class FakeSessionRepository implements SessionRepository {
   rows = new Map<string, StoredSessionRow>();
   createShouldFail = false;
   markRevokedShouldFail = false;
+  updateContextShouldFail = false;
   /**
    * Resolves the *current* password hash of an account. The real adapter
    * fences the session row on `users.password_hash`; the fake resolves the
@@ -212,6 +217,37 @@ export class FakeSessionRepository implements SessionRepository {
     if (row !== undefined) {
       row.lastActivityAt = at;
     }
+  }
+
+  /**
+   * Mirrors the real adapter: only *present* patch fields are written, a
+   * missing or revoked row reports `false`, and a failure flag lets a test
+   * exercise the compensating-revert path of the service.
+   */
+  async updateContext(
+    sessionId: UUID,
+    patch: SessionContextPatch,
+  ): Promise<boolean> {
+    if (this.updateContextShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    const row = this.rows.get(sessionId);
+    if (row === undefined || row.isRevoked) {
+      return false;
+    }
+    if (patch.activeRole !== undefined) {
+      row.activeRole = patch.activeRole;
+    }
+    if (patch.activeCoordinatorAppointmentId !== undefined) {
+      row.activeCoordinatorAppointmentId = patch.activeCoordinatorAppointmentId;
+    }
+    if (patch.mfaVerified !== undefined) {
+      row.mfaVerified = patch.mfaVerified;
+    }
+    if (patch.inactivityTimeoutMinutes !== undefined) {
+      row.inactivityTimeoutMinutes = patch.inactivityTimeoutMinutes;
+    }
+    return true;
   }
 
   /**
@@ -310,6 +346,87 @@ export class FakeProtectionStore implements LoginProtectionStore {
   }
 }
 
+/**
+ * In-memory {@link MfaRepository}. The seed is held in clear text (the
+ * cipher lives in the real adapter only), enrollment overwrites whatever
+ * was there before, and a recovery code is removed on consumption so
+ * single-use behaves exactly like the conditional write in PostgreSQL.
+ */
+export class FakeMfaRepository implements MfaRepository {
+  private readonly enrollments = new Map<
+    string,
+    { secret: string; digests: string[] }
+  >();
+  findShouldFail = false;
+  enrollShouldFail = false;
+  /** Forces `enroll` to report a vanished/deactivated account. */
+  enrollReturnsFalse = false;
+  consumeShouldFail = false;
+  countShouldFail = false;
+  /** Simulates an enrolled account whose stored seed cannot be decrypted. */
+  corruptSecretFor = new Set<string>();
+
+  async findEnrollment(userId: UUID): Promise<MfaEnrollmentState> {
+    if (this.findShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    const record = this.enrollments.get(userId);
+    if (record === undefined) {
+      return { enrolled: false, secret: null };
+    }
+    if (this.corruptSecretFor.has(userId)) {
+      return { enrolled: true, secret: null };
+    }
+    return { enrolled: true, secret: record.secret };
+  }
+
+  async enroll(input: EnrollMfaInput): Promise<boolean> {
+    if (this.enrollShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    if (this.enrollReturnsFalse) {
+      return false;
+    }
+    this.enrollments.set(input.userId, {
+      secret: input.secret,
+      digests: [...input.recoveryCodeHashes],
+    });
+    return true;
+  }
+
+  async consumeRecoveryCode(
+    userId: UUID,
+    codeDigest: string,
+    _now: Date,
+  ): Promise<boolean> {
+    if (this.consumeShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    const record = this.enrollments.get(userId);
+    if (record === undefined) {
+      return false;
+    }
+    const index = record.digests.indexOf(codeDigest);
+    if (index < 0) {
+      return false;
+    }
+    record.digests.splice(index, 1);
+    return true;
+  }
+
+  async countRecoveryCodes(userId: UUID): Promise<number> {
+    if (this.countShouldFail) {
+      throw new Error("postgres unavailable");
+    }
+    return this.enrollments.get(userId)?.digests.length ?? 0;
+  }
+
+  /** Test helper: the recovery-code digests still unused, or `null`. */
+  digestsOf(userId: UUID): string[] | null {
+    return this.enrollments.get(userId)?.digests ?? null;
+  }
+}
+
 export interface FakeAuthFixture {
   service: AuthService;
   accountService: AccountService;
@@ -321,6 +438,7 @@ export interface FakeAuthFixture {
   sessions: FakeSessionRepository;
   sessionStore: FakeSessionStore;
   protection: FakeProtectionStore;
+  mfa: FakeMfaRepository;
   compromisedPasswords: FakeCompromisedPasswordChecker;
   config: AuthConfig;
 }
@@ -501,6 +619,7 @@ export function createFakeAuthFixture(): FakeAuthFixture {
   const sessions = new FakeSessionRepository();
   const sessionStore = new FakeSessionStore();
   const protection = new FakeProtectionStore();
+  const mfa = new FakeMfaRepository();
   const compromisedPasswords = new FakeCompromisedPasswordChecker();
 
   const service = new AuthService({
@@ -512,6 +631,7 @@ export function createFakeAuthFixture(): FakeAuthFixture {
     sessions,
     sessionStore,
     protection,
+    mfa,
   });
 
   const accountService = new AccountService({
@@ -551,6 +671,7 @@ export function createFakeAuthFixture(): FakeAuthFixture {
     sessions,
     sessionStore,
     protection,
+    mfa,
     compromisedPasswords,
     config: testAuthConfig,
   };

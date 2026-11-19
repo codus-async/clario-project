@@ -7,18 +7,26 @@ import {
   activateRequestBodySchema,
   emptyRequestBodySchema,
   loginRequestBodySchema,
+  mfaEnrollRequestBodySchema,
+  mfaVerifyRequestBodySchema,
   passwordResetBodySchema,
   passwordResetRequestBodySchema,
+  sessionContextRequestBodySchema,
 } from "./auth.schemas.js";
 import type { AuthService } from "./auth.service.js";
 import type { AccountService } from "./auth.account.service.js";
 import { createBodyValidator } from "./auth.validation.js";
 
 /**
- * F-64 authentication routes. Every registered route validates its request
- * body with the module's strict Zod schema before the controller runs
- * (F-64 §6). The MFA endpoints are deliberately not registered: they belong
- * to F-65 and must not be exposed as placeholders.
+ * F-64/F-65 authentication routes. Every registered route validates its
+ * request body with the module's strict Zod schema before the controller
+ * runs (F-64 §6).
+ *
+ * The two MFA endpoints and the context switch sit behind `requireSession`
+ * only — never the MFA gate — because a `PRE_MFA` session must be able to
+ * reach `/mfa/enroll` and `/mfa/verify`; `createRequireSession` resolves the
+ * session without demanding `mfa_verified`, and `createRequireMfaVerified`
+ * stays available for the routes that do (F-65 §4).
  */
 export function createAuthRouter(
   authService: AuthService,
@@ -46,6 +54,24 @@ export function createAuthRouter(
     createBodyValidator(emptyRequestBodySchema),
     requireSession,
     controller.heartbeat,
+  );
+  router.post(
+    "/mfa/enroll",
+    createBodyValidator(mfaEnrollRequestBodySchema),
+    requireSession,
+    controller.mfaEnroll,
+  );
+  router.post(
+    "/mfa/verify",
+    createBodyValidator(mfaVerifyRequestBodySchema),
+    requireSession,
+    controller.mfaVerify,
+  );
+  router.put(
+    "/session/context",
+    createBodyValidator(sessionContextRequestBodySchema),
+    requireSession,
+    controller.sessionContext,
   );
   router.post(
     "/activate",

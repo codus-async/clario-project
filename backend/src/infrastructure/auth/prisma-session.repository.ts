@@ -1,9 +1,10 @@
-import type { UUID } from "@clario/shared-contracts";
+import type { RoleCode, UUID } from "@clario/shared-contracts";
 
 import type { PrismaClient } from "../../generated/prisma/client.js";
 import { prisma } from "../database/prisma.js";
 import type {
   NewSessionRow,
+  SessionContextPatch,
   SessionCreationResult,
   SessionCredentialFence,
   SessionRecord,
@@ -126,5 +127,44 @@ export class PrismaSessionRepository implements SessionRepository {
       where: { id: sessionId, is_revoked: false },
       data: { last_activity_at: at },
     });
+  }
+
+  /**
+   * Applies an F-65 context patch (MFA upgrade or active-role switch) to a
+   * live row and reports whether one existed. Only *present* fields are
+   * written, so a patch can revert a single column (the compensation path in
+   * `AuthService.persistSessionUpgrade`) without touching the others; the
+   * `is_revoked` fence means a session revoked mid-flight is never
+   * resurrected by the write.
+   */
+  async updateContext(
+    sessionId: UUID,
+    patch: SessionContextPatch,
+  ): Promise<boolean> {
+    const data: {
+      active_role?: RoleCode;
+      active_coordinator_appointment_id?: string | null;
+      mfa_verified?: boolean;
+      inactivity_timeout_minutes?: number;
+    } = {};
+    if (patch.activeRole !== undefined) {
+      data.active_role = patch.activeRole;
+    }
+    if (patch.activeCoordinatorAppointmentId !== undefined) {
+      data.active_coordinator_appointment_id =
+        patch.activeCoordinatorAppointmentId;
+    }
+    if (patch.mfaVerified !== undefined) {
+      data.mfa_verified = patch.mfaVerified;
+    }
+    if (patch.inactivityTimeoutMinutes !== undefined) {
+      data.inactivity_timeout_minutes = patch.inactivityTimeoutMinutes;
+    }
+
+    const result = await this.client.user_sessions.updateMany({
+      where: { id: sessionId, is_revoked: false },
+      data,
+    });
+    return result.count > 0;
   }
 }

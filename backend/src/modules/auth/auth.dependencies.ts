@@ -10,6 +10,7 @@ import {
   PrismaRoleAssignmentRepository,
   PrismaUserRepository,
 } from "../../infrastructure/auth/prisma-identity.repository.js";
+import { PrismaMfaRepository } from "../../infrastructure/auth/prisma-mfa.repository.js";
 import { PrismaSessionRepository } from "../../infrastructure/auth/prisma-session.repository.js";
 import { RedisLoginProtectionStore } from "../../infrastructure/auth/redis-login-protection.store.js";
 import { RedisSessionStore } from "../../infrastructure/auth/redis-session.store.js";
@@ -40,6 +41,7 @@ export const authService = new AuthService({
   sessions,
   sessionStore,
   protection: new RedisLoginProtectionStore(redis, authConfig.protection),
+  mfa: new PrismaMfaRepository(),
 });
 
 export const accountService = new AccountService({

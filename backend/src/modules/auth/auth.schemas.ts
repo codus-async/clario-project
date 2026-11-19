@@ -1,9 +1,13 @@
 import {
   CLARIO_SYSTEM_CONSTANTS,
   type LoginRequestDto,
+  type MfaVerifyRequestDto,
+  type SwitchActiveContextRequestDto,
+  roleCodeSchema,
 } from "@clario/shared-contracts";
 import { z } from "zod";
 
+import { MFA_CODE_MAX_LENGTH } from "./auth.totp.js";
 import {
   MAX_IDENTIFIER_LENGTH,
   MAX_INSTITUTION_CODE_LENGTH,
@@ -177,3 +181,84 @@ export type PasswordResetBody = z.infer<typeof passwordResetBodySchema>;
 export const emptyRequestBodySchema = z.strictObject({});
 
 export type EmptyRequestBody = z.infer<typeof emptyRequestBodySchema>;
+
+/**
+ * `POST /api/v1/auth/mfa/enroll` (F-65). The endpoint takes no body — the
+ * enrollment is bound to the `PRE_MFA` session cookie — so the same
+ * bodyless contract as logout/heartbeat applies: an absent body is valid,
+ * any field is rejected as unknown.
+ */
+export const mfaEnrollRequestBodySchema = emptyRequestBodySchema;
+
+export type MfaEnrollRequestBody = z.infer<typeof mfaEnrollRequestBodySchema>;
+
+/**
+ * `POST /api/v1/auth/mfa/verify` (F-65). Field-for-field parity with the
+ * shared `MfaVerifyRequestDto`: a single `totpCode` that carries either a
+ * 6-digit TOTP code or one of the ten recovery codes (SEC-06). The value is
+ * trimmed — authenticator apps and password managers disagree about trailing
+ * whitespace — and bounded so a hostile payload never reaches the HMAC or
+ * the digest comparison; which of the two forms it *is* is decided by the
+ * application service, not by the schema (F-65 §10).
+ */
+export const mfaVerifyRequestBodySchema = z.strictObject({
+  totpCode: z
+    .string()
+    .trim()
+    .min(1, "totpCode is required.")
+    .max(
+      MFA_CODE_MAX_LENGTH,
+      `totpCode must be at most ${String(MFA_CODE_MAX_LENGTH)} characters.`,
+    ),
+});
+
+export type MfaVerifyRequestBody = z.infer<typeof mfaVerifyRequestBodySchema>;
+
+/**
+ * Compile-time parity with the shared contract (F-65 §8): the schema and
+ * `MfaVerifyRequestDto` must declare exactly the same keys, and the
+ * inferred request body must be assignable in both directions. `Assert` and
+ * `SameKeys` are the helpers declared for the login parity above.
+ */
+export type MfaVerifyRequestBodyDtoParity = [
+  Assert<MfaVerifyRequestBody extends MfaVerifyRequestDto ? true : false>,
+  Assert<MfaVerifyRequestDto extends MfaVerifyRequestBody ? true : false>,
+  Assert<SameKeys<MfaVerifyRequestBody, MfaVerifyRequestDto>>,
+];
+
+/**
+ * `PUT /api/v1/auth/session/context` (F-65). Field-for-field parity with
+ * the shared `SwitchActiveContextRequestDto`: the target role is validated
+ * against the documented role enum at the request edge, and the coordinator
+ * appointment id — when present — must be a UUID. Whether the appointment
+ * is *mandatory* (BR-03: only when the target role is
+ * `PROJECT_COORDINATOR`) and whether the account actually holds it are
+ * business rules and stay in `AuthService.updateSessionContext`.
+ */
+export const sessionContextRequestBodySchema = z.strictObject({
+  targetRole: roleCodeSchema,
+  coordinatorAppointmentId: z.uuid().optional(),
+});
+
+export type SessionContextRequestBody = z.infer<
+  typeof sessionContextRequestBodySchema
+>;
+
+/**
+ * Compile-time parity with the shared `SwitchActiveContextRequestDto`
+ * (F-65 §8), including the exact key set — an optional field that drifts
+ * out of (or into) the DTO fails `tsc`.
+ */
+export type SessionContextRequestBodyDtoParity = [
+  Assert<
+    SessionContextRequestBody extends SwitchActiveContextRequestDto
+      ? true
+      : false
+  >,
+  Assert<
+    SwitchActiveContextRequestDto extends SessionContextRequestBody
+      ? true
+      : false
+  >,
+  Assert<SameKeys<SessionContextRequestBody, SwitchActiveContextRequestDto>>,
+];

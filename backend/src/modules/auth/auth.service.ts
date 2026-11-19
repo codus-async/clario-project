@@ -23,19 +23,34 @@ import type {
   InstitutionRepository,
   LoginProtectionStore,
   LoginUserRecord,
+  MfaRepository,
   PasswordHasher,
   RoleAssignmentRepository,
+  SessionContextPatch,
   SessionCreationResult,
   SessionRepository,
   SessionStore,
   UserRepository,
   VerificationSlot,
 } from "./auth.ports.js";
+import {
+  buildTotpProvisioningUri,
+  generateRecoveryCodes,
+  generateTotpSecret,
+  hashRecoveryCode,
+  isTotpCodeShape,
+  verifyTotpCode,
+} from "./auth.totp.js";
 import type {
   AuthSessionContext,
   HeartbeatResult,
   LoginInput,
   LoginResult,
+  MfaEnrollResult,
+  MfaVerifyInput,
+  MfaVerifyResult,
+  SessionContextInput,
+  SessionContextResult,
   SessionCredential,
   SessionState,
 } from "./auth.types.js";
@@ -78,6 +93,7 @@ export interface AuthServiceDeps {
   sessions: SessionRepository;
   sessionStore: SessionStore;
   protection: LoginProtectionStore;
+  mfa: MfaRepository;
 }
 
 function fieldError(field: string, message: string): AppError {
@@ -131,6 +147,18 @@ function scopeDenied(detail: string): AppError {
   return new AppError(ERROR_CODES.OUT_OF_ASSIGNMENT_SCOPE, detail);
 }
 
+/**
+ * A rejected MFA code. Returned as 400 with the field named so the client
+ * can re-prompt inline — never 401, which would wrongly imply the *session*
+ * is invalid and log the user out of a challenge they can still retry.
+ */
+function invalidMfaCode(): AppError {
+  const detail = "The MFA code is invalid or has expired.";
+  return new AppError(ERROR_CODES.VALIDATION_ERROR, detail, [
+    { field: "totpCode", message: detail },
+  ]);
+}
+
 export class AuthService {
   private readonly config: AuthConfig;
   private readonly hasher: PasswordHasher;
@@ -140,6 +168,7 @@ export class AuthService {
   private readonly sessions: SessionRepository;
   private readonly sessionStore: SessionStore;
   private readonly protection: LoginProtectionStore;
+  private readonly mfa: MfaRepository;
 
   constructor(deps: AuthServiceDeps) {
     this.config = deps.config;
@@ -150,6 +179,7 @@ export class AuthService {
     this.sessions = deps.sessions;
     this.sessionStore = deps.sessionStore;
     this.protection = deps.protection;
+    this.mfa = deps.mfa;
   }
 
   // -------------------------------------------------------------------------
@@ -490,6 +520,413 @@ export class AuthService {
   }
 
   // -------------------------------------------------------------------------
+  // POST /api/v1/auth/mfa/enroll  (F-65 §2.1, FR-224, SEC-06)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Binds a fresh TOTP seed and ten single-use recovery codes to the
+   * account behind a `PRE_MFA` session.
+   *
+   * The seed is stored encrypted and the recovery codes only as SHA-256
+   * digests; both plaintext values leave the service exactly once, in this
+   * response. Enrollment may be repeated while the challenge is outstanding
+   * (the previous codes are voided), but never *after* verification: a
+   * stolen full session must not be able to re-bind the authenticator it
+   * was challenged with.
+   */
+  async enrollMfa(sessionId: UUID): Promise<MfaEnrollResult> {
+    const state = await this.loadLiveSession(sessionId);
+
+    if (state.mfaVerified) {
+      throw new AppError(
+        ERROR_CODES.VALIDATION_ERROR,
+        "MFA is already enrolled and verified for this session.",
+      );
+    }
+
+    const secret = generateTotpSecret();
+    const recoveryCodes = generateRecoveryCodes();
+    const now = new Date();
+
+    let persisted: boolean;
+    try {
+      persisted = await this.mfa.enroll({
+        userId: state.userId,
+        secret,
+        recoveryCodeHashes: recoveryCodes.map(hashRecoveryCode),
+        now,
+      });
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", userId: state.userId },
+        "Failed to persist the MFA enrollment",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA enrollment could not be completed. Please try again.",
+      );
+    }
+    if (!persisted) {
+      // The account vanished or was deactivated between the session check
+      // and this write — no authenticator may be issued for it.
+      throw new AppError(
+        ERROR_CODES.UNAUTHENTICATED,
+        "The account is no longer active.",
+      );
+    }
+
+    const enrolledState: SessionState = { ...state, mfaEnrolled: true };
+    try {
+      await this.sessionStore.set(
+        enrolledState,
+        this.ttlSeconds(enrolledState, Date.now()),
+      );
+    } catch (error) {
+      // The account *is* enrolled; only the session's convenience copy
+      // failed. The codes above were never delivered, and re-enrolling
+      // replaces the seed — so fail the request and let the client start
+      // over with a fresh pair rather than show an out-of-sync UI.
+      baseLogger.error(
+        { err: error, module: "auth", userId: state.userId },
+        "Failed to record the MFA enrollment on the session",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA enrollment could not be completed. Please try again.",
+      );
+    }
+
+    return {
+      secret,
+      provisioningUri: buildTotpProvisioningUri({
+        secret,
+        account: state.email,
+      }),
+      recoveryCodes,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // POST /api/v1/auth/mfa/verify  (F-65 §2.2, FR-224, SEC-06)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Completes the MFA challenge: accepts either a 6-digit TOTP code or one
+   * of the ten recovery codes, then upgrades the session's `mfa_verified`
+   * flag in both the `user_sessions` row and the Redis state so that
+   * `assertMfaSatisfied` lets subsequent requests through.
+   *
+   * Failures are counted against the same FR-221 windows as login (keyed by
+   * IP + user id), so a brute-force run against the challenge locks out the
+   * same way a password run does. A rejected code returns 400 — never 401 —
+   * because the session itself is still valid and must not be dropped by the
+   * client.
+   */
+  async verifyMfa(input: MfaVerifyInput): Promise<MfaVerifyResult> {
+    const state = await this.loadLiveSession(input.sessionId);
+    const protectionKey = { ip: input.ip, identifier: state.userId };
+
+    await this.assertNotLocked(protectionKey);
+
+    const enrollment = await this.loadEnrollment(state.userId);
+
+    if (!enrollment.enrolled) {
+      throw new AppError(
+        ERROR_CODES.MFA_ENROLLMENT_REQUIRED,
+        "MFA enrollment is required before the challenge can be verified.",
+      );
+    }
+    if (enrollment.secret === null) {
+      // Enrolled but the stored seed cannot be decrypted — a key/config
+      // problem, not a user error. Fail closed without consuming anything.
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA verification is temporarily unavailable. Please try again.",
+      );
+    }
+
+    const code = input.code;
+    const now = new Date();
+    let verified: boolean;
+    if (isTotpCodeShape(code)) {
+      // RFC 6238, one step of clock skew either way (30s step).
+      verified = verifyTotpCode(
+        enrollment.secret,
+        code,
+        Math.floor(now.getTime() / 1_000),
+      );
+    } else {
+      // Everything that is not a 6-digit code is a recovery code. The two
+      // shapes cannot collide (recovery codes normalize to 16 characters),
+      // so a submission is never routed to the wrong verifier.
+      verified = await this.consumeRecoveryCode(
+        state.userId,
+        hashRecoveryCode(code),
+        now,
+      );
+    }
+
+    if (!verified) {
+      await this.recordLoginFailure(protectionKey);
+      throw invalidMfaCode();
+    }
+    await this.recordLoginSuccess(protectionKey);
+
+    // Counted *before* the session upgrade: a failure here must not leave a
+    // verified session behind a request the client was told failed. For the
+    // recovery path the submitted code is already spent — the retry uses
+    // another code (or a TOTP code), which is the intended cost of a
+    // single-use secret.
+    const recoveryCodesRemaining = await this.countRecoveryCodes(
+      state.userId,
+    );
+
+    const upgraded: SessionState = { ...state, mfaVerified: true };
+    await this.persistSessionUpgrade(
+      upgraded,
+      { mfaVerified: true },
+      { mfaVerified: false },
+      "MFA verification",
+    );
+
+    return {
+      sessionId: state.sessionId,
+      recoveryCodesRemaining,
+      expiresAtUtc: upgraded.expiresAtUtc,
+      inactivityTimeoutMinutes: upgraded.inactivityTimeoutMinutes,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // PUT /api/v1/auth/session/context  (F-65 §3, FR-047, BR-03)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Switches the active role of a live session — and, for the coordinator
+   * role, binds it to exactly one of the account's active appointments
+   * (BR-03: one appointment = one programme + one academic session).
+   *
+   * The target role must be one the account still holds; the appointment
+   * must be one of the scopes revalidated on every request. Both copies of
+   * the session are rewritten together so the Redis/PostgreSQL cross-check
+   * in `loadLiveSession` never observes a half-applied switch.
+   */
+  async updateSessionContext(
+    input: SessionContextInput,
+  ): Promise<SessionContextResult> {
+    const state = await this.loadLiveSession(input.sessionId);
+    const targetRole = input.targetRole;
+
+    if (!state.assignedRoles.includes(targetRole)) {
+      throw scopeDenied(
+        "The requested active role is not assigned to this account.",
+      );
+    }
+
+    let activeCoordinatorScope: CoordinatorScopeContext | null = null;
+    // Refreshed from the repository for the coordinator target below; kept as
+    // the session copy for every other target.
+    let coordinatorAppointments = state.coordinatorAppointments;
+
+    if (targetRole === RoleCode.PROJECT_COORDINATOR) {
+      if (input.coordinatorAppointmentId === undefined) {
+        throw fieldError(
+          "coordinatorAppointmentId",
+          "BR-03: coordinatorAppointmentId is required when targetRole is PROJECT_COORDINATOR.",
+        );
+      }
+      if (state.institutionId === null) {
+        // Unreachable in practice — platform admins hold no coordinator
+        // role, so the assigned-role check above already rejected them —
+        // but the appointment query is tenant-scoped and must not run
+        // without a tenant.
+        throw scopeDenied(
+          "BR-03: the coordinator role requires an institutional appointment.",
+        );
+      }
+
+      // The session copy of the appointments is only populated when the
+      // *login* itself selected the coordinator role, and it only reflects
+      // login time either way. BR-03 binds to what the account holds *now*,
+      // and the next revalidation compares against this same list — so load
+      // it fresh and persist it with the switch.
+      coordinatorAppointments = await this.loadCoordinatorScopes(
+        state.userId,
+        state.institutionId,
+      );
+
+      const selected = coordinatorAppointments.find(
+        (scope) => scope.appointmentId === input.coordinatorAppointmentId,
+      );
+      if (selected === undefined) {
+        throw scopeDenied(
+          "BR-03: the selected coordinator appointment is not one of the account's active appointments.",
+        );
+      }
+      activeCoordinatorScope = selected;
+    } else if (input.coordinatorAppointmentId !== undefined) {
+      throw fieldError(
+        "coordinatorAppointmentId",
+        "coordinatorAppointmentId is only valid when targetRole is PROJECT_COORDINATOR.",
+      );
+    }
+
+    const now = Date.now();
+    const inactivityTimeoutMinutes = inactivityTimeoutMinutesFor(
+      this.config,
+      targetRole,
+    );
+    const updated: SessionState = {
+      ...state,
+      activeRole: targetRole,
+      coordinatorAppointments,
+      activeCoordinatorScope,
+      inactivityTimeoutMinutes,
+    };
+
+    await this.persistSessionUpgrade(
+      updated,
+      {
+        activeRole: targetRole,
+        activeCoordinatorAppointmentId:
+          activeCoordinatorScope?.appointmentId ?? null,
+        inactivityTimeoutMinutes,
+      },
+      {
+        activeRole: state.activeRole,
+        activeCoordinatorAppointmentId:
+          state.activeCoordinatorScope?.appointmentId ?? null,
+        inactivityTimeoutMinutes: state.inactivityTimeoutMinutes,
+      },
+      "session context switch",
+    );
+
+    return {
+      sessionId: state.sessionId,
+      activeRole: targetRole,
+      activeCoordinatorScope,
+      mfaRequired: updated.mfaRequired,
+      mfaVerified: updated.mfaVerified,
+      inactivityTimeoutMinutes,
+      expiresAtUtc: updated.expiresAtUtc,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // F-65 shared helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Reads the account's MFA material. A storage/cipher failure is reported
+   * as a service outage (the caller fails closed) rather than as "not
+   * enrolled", which would push an enrolled user back into enrollment.
+   */
+  private async loadEnrollment(
+    userId: UUID,
+  ): Promise<{ enrolled: boolean; secret: string | null }> {
+    try {
+      return await this.mfa.findEnrollment(userId);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", userId },
+        "Failed to read the MFA enrollment",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA verification is temporarily unavailable. Please try again.",
+      );
+    }
+  }
+
+  private async consumeRecoveryCode(
+    userId: UUID,
+    codeDigest: string,
+    now: Date,
+  ): Promise<boolean> {
+    try {
+      return await this.mfa.consumeRecoveryCode(userId, codeDigest, now);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", userId },
+        "Failed to consume a recovery code",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA verification is temporarily unavailable. Please try again.",
+      );
+    }
+  }
+
+  private async countRecoveryCodes(userId: UUID): Promise<number> {
+    try {
+      return await this.mfa.countRecoveryCodes(userId);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", userId },
+        "Failed to count the remaining recovery codes",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "MFA verification is temporarily unavailable. Please try again.",
+      );
+    }
+  }
+
+  /**
+   * Writes an F-65 context change to both copies of the session — first the
+   * authoritative `user_sessions` row, then the Redis runtime state — and
+   * compensates the row when the Redis write fails, so `loadLiveSession`
+   * never sees a half-applied change. If the compensation itself fails the
+   * two copies disagree and the next request fails closed (revokes the
+   * session), which is the safe direction for an ambiguous write.
+   */
+  private async persistSessionUpgrade(
+    state: SessionState,
+    patch: SessionContextPatch,
+    revertPatch: SessionContextPatch,
+    operation: string,
+  ): Promise<void> {
+    let rowApplied: boolean;
+    try {
+      rowApplied = await this.sessions.updateContext(state.sessionId, patch);
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", operation },
+        "Failed to persist the session row",
+      );
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "The session update could not be completed. Please try again.",
+      );
+    }
+    if (!rowApplied) {
+      // Revoked between loadLiveSession and this write.
+      throw sessionRevoked();
+    }
+
+    try {
+      await this.sessionStore.set(state, this.ttlSeconds(state, Date.now()));
+    } catch (error) {
+      baseLogger.error(
+        { err: error, module: "auth", operation },
+        "Failed to persist the runtime session state",
+      );
+      try {
+        await this.sessions.updateContext(state.sessionId, revertPatch);
+      } catch (revertError) {
+        baseLogger.error(
+          { err: revertError, module: "auth", operation },
+          "Failed to roll the session row back",
+        );
+      }
+      throw new AppError(
+        ERROR_CODES.SERVICE_UNAVAILABLE,
+        "The session update could not be completed. Please try again.",
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Session middleware support
   // -------------------------------------------------------------------------
 
@@ -604,7 +1041,7 @@ export class AuthService {
       return;
     }
 
-    const freshScopes = await this.loadCoordinatorScopesForRevalidation(
+    const freshScopes = await this.loadCoordinatorScopes(
       state.userId,
       institutionId,
     );
@@ -638,7 +1075,7 @@ export class AuthService {
     }
   }
 
-  private async loadCoordinatorScopesForRevalidation(
+  private async loadCoordinatorScopes(
     userId: UUID,
     institutionId: UUID,
   ): Promise<CoordinatorScopeContext[]> {

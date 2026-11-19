@@ -4,9 +4,13 @@ import {
   activateRequestBodySchema,
   emptyRequestBodySchema,
   loginRequestBodySchema,
+  mfaEnrollRequestBodySchema,
+  mfaVerifyRequestBodySchema,
   passwordResetBodySchema,
+  sessionContextRequestBodySchema,
 } from "../../../modules/auth/auth.schemas.js";
 import { MAX_PASSWORD_LENGTH } from "../../../modules/auth/auth.password-policy.js";
+import { MFA_CODE_MAX_LENGTH } from "../../../modules/auth/auth.totp.js";
 
 const VALID_LOGIN = {
   identifier: "tunde.adewale@unilag.edu.ng",
@@ -371,5 +375,139 @@ describe("emptyRequestBodySchema", () => {
     expect(parse(emptyRequestBodySchema, ["x"])).toBe(false);
     expect(parse(emptyRequestBodySchema, "body")).toBe(false);
     expect(parse(emptyRequestBodySchema, null)).toBe(false);
+  });
+});
+
+describe("mfaEnrollRequestBodySchema", () => {
+  it("is the bodyless contract: enrollment takes no request body", () => {
+    // Documented alias — F-65 §2.1 defines no body, so the enrollment edge
+    // must behave exactly like logout/heartbeat.
+    expect(mfaEnrollRequestBodySchema).toBe(emptyRequestBodySchema);
+    expect(parse(mfaEnrollRequestBodySchema, {})).toBe(true);
+  });
+
+  it("rejects any field, so a stray body never reaches the controller", () => {
+    expect(parse(mfaEnrollRequestBodySchema, { totpCode: "123456" })).toBe(
+      false,
+    );
+    expect(parse(mfaEnrollRequestBodySchema, { secret: "AAA" })).toBe(false);
+  });
+});
+
+describe("mfaVerifyRequestBodySchema", () => {
+  it("accepts a 6-digit TOTP code", () => {
+    expect(parse(mfaVerifyRequestBodySchema, { totpCode: "048291" })).toBe(
+      true,
+    );
+  });
+
+  it("accepts a recovery code", () => {
+    expect(
+      parse(mfaVerifyRequestBodySchema, {
+        totpCode: "ABCD-EF01-2345-6789",
+      }),
+    ).toBe(true);
+  });
+
+  it("trims whitespace around the submitted code", () => {
+    const result = mfaVerifyRequestBodySchema.safeParse({
+      totpCode: "  048291  ",
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.totpCode).toBe("048291");
+    }
+  });
+
+  it("rejects a missing, empty or whitespace-only code", () => {
+    expect(parse(mfaVerifyRequestBodySchema, {})).toBe(false);
+    expect(parse(mfaVerifyRequestBodySchema, { totpCode: "" })).toBe(false);
+    expect(parse(mfaVerifyRequestBodySchema, { totpCode: "   " })).toBe(false);
+  });
+
+  it("rejects a code longer than the documented bound", () => {
+    expect(
+      parse(mfaVerifyRequestBodySchema, {
+        totpCode: "a".repeat(MFA_CODE_MAX_LENGTH + 1),
+      }),
+    ).toBe(false);
+    expect(
+      parse(mfaVerifyRequestBodySchema, {
+        totpCode: "a".repeat(MFA_CODE_MAX_LENGTH),
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects unknown request fields", () => {
+    expect(
+      parse(mfaVerifyRequestBodySchema, {
+        totpCode: "048291",
+        recoveryCode: "ABCD-EF01-2345-6789",
+      }),
+    ).toBe(false);
+    expect(parse(mfaVerifyRequestBodySchema, ["048291"])).toBe(false);
+  });
+});
+
+describe("sessionContextRequestBodySchema", () => {
+  it("accepts a target role without an appointment", () => {
+    expect(parse(sessionContextRequestBodySchema, { targetRole: "STUDENT" })).toBe(
+      true,
+    );
+    expect(
+      parse(sessionContextRequestBodySchema, {
+        targetRole: "PROJECT_SUPERVISOR",
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts the coordinator target with its appointment id", () => {
+    expect(
+      parse(sessionContextRequestBodySchema, {
+        targetRole: "PROJECT_COORDINATOR",
+        coordinatorAppointmentId: "33333333-3333-4333-8333-333333333333",
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts every documented role code", () => {
+    for (const targetRole of [
+      "PLATFORM_ADMIN",
+      "INSTITUTIONAL_ADMIN",
+      "PROJECT_COORDINATOR",
+      "PROJECT_SUPERVISOR",
+      "PROJECT_EXAMINER",
+      "STUDENT",
+    ]) {
+      expect(parse(sessionContextRequestBodySchema, { targetRole })).toBe(true);
+    }
+  });
+
+  it("rejects a role outside the documented enum", () => {
+    expect(parse(sessionContextRequestBodySchema, { targetRole: "ADMIN" })).toBe(
+      false,
+    );
+    expect(
+      parse(sessionContextRequestBodySchema, { targetRole: "coordinator" }),
+    ).toBe(false);
+    expect(parse(sessionContextRequestBodySchema, {})).toBe(false);
+  });
+
+  it("rejects an appointment id that is not a UUID", () => {
+    expect(
+      parse(sessionContextRequestBodySchema, {
+        targetRole: "PROJECT_COORDINATOR",
+        coordinatorAppointmentId: "not-a-uuid",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects unknown request fields", () => {
+    expect(
+      parse(sessionContextRequestBodySchema, {
+        targetRole: "STUDENT",
+        sessionId: "44444444-4444-4444-8444-444444444444",
+      }),
+    ).toBe(false);
   });
 });

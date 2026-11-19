@@ -6,6 +6,7 @@ import { requestContextMiddleware } from "./middleware/request-context.middlewar
 import { errorHandler } from "./middleware/error-handler.js";
 import { healthRouter } from "./modules/health/health.routes.js";
 import { authRouter } from "./modules/auth/auth.dependencies.js";
+import { policyEnforcementPoint } from "./modules/access-control/pep.dependencies.js";
 
 export function createApp(): Express {
   const app = express();
@@ -20,7 +21,11 @@ export function createApp(): Express {
   app.use(express.json({ limit: "1mb" }));
 
   app.use("/health", healthRouter);
+  // The F-64/F-65 auth flows must stay reachable for unauthenticated and
+  // PRE_MFA sessions, so they are mounted before — and exempted from — the
+  // F-66 Policy Enforcement Point.
   app.use("/api/v1/auth", authRouter);
+  app.use(policyEnforcementPoint);
 
   app.use(errorHandler);
 
