@@ -11,6 +11,7 @@ import {
 } from "../../../modules/auth/auth.middleware.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
+import { generateTotpCode } from "../../../modules/auth/auth.totp.js";
 import {
   INVITATION_TOKEN,
   LOGIN_BODY,
@@ -702,5 +703,321 @@ describe("POST /api/v1/auth/password/reset", () => {
     expect(response.status).toBe(400);
     expect(response.body.error.code).toBe("VALIDATION_ERROR");
     expect(response.body.error.field_errors?.[0]?.field).toBe("password");
+  });
+});
+
+// ===========================================================================
+// F-65: MFA enrollment, challenge and session context routes
+// ===========================================================================
+
+/** Logs in and returns the session cookie of the response. */
+async function loginWithRole(
+  app: ReturnType<typeof express>,
+  activeRole: RoleCode,
+): Promise<string> {
+  const response = await request(app)
+    .post("/api/v1/auth/login")
+    .set("X-Clario-Active-Role", activeRole)
+    .send(LOGIN_BODY);
+
+  expect(response.status).toBe(200);
+  return setCookieHeaders(response)[0]?.split(";")[0] ?? "";
+}
+
+describe("POST /api/v1/auth/mfa/enroll", () => {
+  it("requires authentication", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .send({});
+
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("issues the seed, provisioning URI and ten recovery codes", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+
+    expect(response.status).toBe(201);
+    expect(response.body.secret).toMatch(/^[A-Z2-7]{32}$/);
+    expect(String(response.body.provisioning_uri).startsWith(
+      "otpauth://totp/",
+    )).toBe(true);
+    expect(response.body.recovery_codes).toHaveLength(10);
+    expect(new Set(response.body.recovery_codes).size).toBe(10);
+  });
+
+  it("rejects a body the contract does not define", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({ totpCode: "123456" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("issues a fresh pair when enrollment repeats before verification", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const first = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+    const second = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(second.body.secret).not.toBe(first.body.secret);
+  });
+});
+
+describe("POST /api/v1/auth/mfa/verify", () => {
+  /** Enrolls through the HTTP edge and returns the issued seed. */
+  async function enrollThroughHttp(
+    app: ReturnType<typeof express>,
+    cookie: string,
+  ): Promise<string> {
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+    expect(response.status).toBe(201);
+    return String(response.body.secret);
+  }
+
+  it("requires authentication", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .send({ totpCode: "123456" });
+
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("completes the challenge while the session is still unverified", async () => {
+    // The route must sit behind `requireSession` only: an unverified
+    // session is exactly what reaches it.
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+    const secret = await enrollThroughHttp(app, cookie);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: generateTotpCode(secret) });
+
+    expect(response.status).toBe(200);
+    expect(response.body.session_id).toBeDefined();
+    expect(response.body.recovery_codes_remaining).toBe(10);
+    expect(response.body.expires_at_utc).toBeDefined();
+    expect(response.body.inactivity_timeout_minutes).toBe(60);
+  });
+
+  it("leaves a wrong code on a valid session with a 400 field error", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+    const secret = await enrollThroughHttp(app, cookie);
+
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    const current = generateTotpCode(secret, nowSeconds);
+    let stale = generateTotpCode(secret, nowSeconds - 3_600);
+    if (stale === current) {
+      stale = generateTotpCode(secret, nowSeconds - 7_200);
+    }
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: stale });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("totpCode");
+
+    // The session itself is untouched: the client keeps it and retries.
+    const protectedResponse = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+    expect(protectedResponse.status).toBe(200);
+  });
+
+  it("rejects a missing code", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({});
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("totpCode");
+  });
+
+  it("rejects an unknown field", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: "123456", recoveryCode: "ABCD-EF01-2345-6789" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects a challenge for an account that never enrolled", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: "123456" });
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("MFA_ENROLLMENT_REQUIRED");
+  });
+});
+
+describe("PUT /api/v1/auth/session/context", () => {
+  it("requires authentication", async () => {
+    const app = buildApp(seededFixture());
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .send({ targetRole: RoleCode.STUDENT });
+
+    expect(response.status).toBe(401);
+    expect(response.body.error.code).toBe("UNAUTHENTICATED");
+  });
+
+  it("switches the active role of the session", async () => {
+    const app = buildApp(
+      seededFixture([RoleCode.PROJECT_SUPERVISOR, RoleCode.STUDENT]),
+    );
+    const cookie = await loginWithRole(app, RoleCode.PROJECT_SUPERVISOR);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: RoleCode.STUDENT });
+
+    expect(response.status).toBe(200);
+    expect(response.body.session_id).toBeDefined();
+    expect(response.body.active_role).toBe(RoleCode.STUDENT);
+    expect(response.body.active_coordinator_scope).toBeNull();
+    expect(response.body.inactivity_timeout_minutes).toBe(60);
+
+    const protectedResponse = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+    expect(protectedResponse.status).toBe(200);
+    expect(protectedResponse.body.activeRole).toBe(RoleCode.STUDENT);
+  });
+
+  it("binds the coordinator role to an appointment", async () => {
+    const scope = coordinatorScope();
+    const fixture = seededFixture([
+      RoleCode.PROJECT_SUPERVISOR,
+      RoleCode.PROJECT_COORDINATOR,
+    ]);
+    seedCoordinatorScopes(fixture, [scope]);
+    const app = buildApp(fixture);
+    const cookie = await loginWithRole(app, RoleCode.PROJECT_SUPERVISOR);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({
+        targetRole: RoleCode.PROJECT_COORDINATOR,
+        coordinatorAppointmentId: scope.appointmentId,
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.active_role).toBe(RoleCode.PROJECT_COORDINATOR);
+    expect(response.body.active_coordinator_scope?.appointment_id).toBe(
+      scope.appointmentId,
+    );
+    expect(response.body.inactivity_timeout_minutes).toBe(30);
+  });
+
+  it("requires an appointment for the coordinator target", async () => {
+    const fixture = seededFixture([
+      RoleCode.PROJECT_SUPERVISOR,
+      RoleCode.PROJECT_COORDINATOR,
+    ]);
+    seedCoordinatorScopes(fixture, [coordinatorScope()]);
+    const app = buildApp(fixture);
+    const cookie = await loginWithRole(app, RoleCode.PROJECT_SUPERVISOR);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: RoleCode.PROJECT_COORDINATOR });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe(
+      "coordinatorAppointmentId",
+    );
+  });
+
+  it("rejects a role outside the documented enum", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: "SUPERUSER" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+    expect(response.body.error.field_errors?.[0]?.field).toBe("targetRole");
+  });
+
+  it("rejects an unknown field", async () => {
+    const app = buildApp(seededFixture());
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: RoleCode.STUDENT, sessionId: "anything" });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects a target role the account does not hold", async () => {
+    const app = buildApp(seededFixture([RoleCode.PROJECT_SUPERVISOR]));
+    const { cookie } = await login(app);
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: RoleCode.PLATFORM_ADMIN });
+
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("OUT_OF_ASSIGNMENT_SCOPE");
   });
 });

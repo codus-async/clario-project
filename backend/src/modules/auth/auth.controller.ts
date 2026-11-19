@@ -1,4 +1,4 @@
-import { CLARIO_HTTP_HEADERS } from "@clario/shared-contracts";
+import { CLARIO_HTTP_HEADERS, MANDATORY_MFA_ROLES } from "@clario/shared-contracts";
 import type { RequestHandler } from "express";
 
 import { AppError } from "../../errors/app-error.js";
@@ -14,8 +14,10 @@ import type { LoginResult } from "./auth.types.js";
 import type {
   ActivateRequestBody,
   LoginRequestBody,
+  MfaVerifyRequestBody,
   PasswordResetBody,
   PasswordResetRequestBody,
+  SessionContextRequestBody,
 } from "./auth.schemas.js";
 import { getValidatedBody } from "./auth.validation.js";
 
@@ -72,6 +74,9 @@ export function createAuthController(deps: AuthControllerDeps): {
   login: RequestHandler;
   logout: RequestHandler;
   heartbeat: RequestHandler;
+  mfaEnroll: RequestHandler;
+  mfaVerify: RequestHandler;
+  sessionContext: RequestHandler;
   activate: RequestHandler;
   requestPasswordReset: RequestHandler;
   resetPassword: RequestHandler;
@@ -145,6 +150,111 @@ export function createAuthController(deps: AuthControllerDeps): {
     });
   };
 
+  /**
+   * `POST /api/v1/auth/mfa/enroll` (F-65 §2.1): 201 with the seed, the
+   * `otpauth://` URI for the QR code, and the ten recovery codes — the only
+   * time any of them are ever returned.
+   */
+  const mfaEnroll: RequestHandler = async (req, res) => {
+    const context = req.authContext;
+    if (context === undefined) {
+      throw new AppError(
+        ERROR_CODES.UNAUTHENTICATED,
+        "Authentication credentials were not provided.",
+      );
+    }
+
+    const result = await authService.enrollMfa(context.sessionId);
+
+    res.status(201).json({
+      secret: result.secret,
+      provisioning_uri: result.provisioningUri,
+      recovery_codes: result.recoveryCodes,
+    });
+  };
+
+  /**
+   * `POST /api/v1/auth/mfa/verify` (F-65 §2.2): completes the challenge and
+   * upgrades the session; the response carries the new session lifetime and
+   * how many recovery codes remain unused.
+   */
+  const mfaVerify: RequestHandler = async (req, res) => {
+    const context = req.authContext;
+    if (context === undefined) {
+      throw new AppError(
+        ERROR_CODES.UNAUTHENTICATED,
+        "Authentication credentials were not provided.",
+      );
+    }
+
+    const body = getValidatedBody<MfaVerifyRequestBody>(req);
+
+    const result = await authService.verifyMfa({
+      sessionId: context.sessionId,
+      code: body.totpCode,
+      ip: req.ip ?? "",
+    });
+
+    res.status(200).json({
+      session_id: result.sessionId,
+      recovery_codes_remaining: result.recoveryCodesRemaining,
+      expires_at_utc: result.expiresAtUtc,
+      inactivity_timeout_minutes: result.inactivityTimeoutMinutes,
+    });
+  };
+
+  /**
+   * `PUT /api/v1/auth/session/context` (F-65 §3): switches the active role
+   * (and, for coordinators, the bound appointment). `next_step` is
+   * recomputed against the *live* mandatory-MFA rule, because switching
+   * into a `MANDATORY_MFA_ROLES` role can make an unverified session
+   * subject to the challenge even though login did not require it.
+   */
+  const sessionContext: RequestHandler = async (req, res) => {
+    const context = req.authContext;
+    if (context === undefined) {
+      throw new AppError(
+        ERROR_CODES.UNAUTHENTICATED,
+        "Authentication credentials were not provided.",
+      );
+    }
+
+    const body = getValidatedBody<SessionContextRequestBody>(req);
+
+    const result = await authService.updateSessionContext({
+      sessionId: context.sessionId,
+      targetRole: body.targetRole,
+      coordinatorAppointmentId: body.coordinatorAppointmentId,
+    });
+
+    const mfaMandatory =
+      result.mfaRequired || MANDATORY_MFA_ROLES.includes(result.activeRole);
+
+    res.status(200).json({
+      session_id: result.sessionId,
+      active_role: result.activeRole,
+      active_coordinator_scope:
+        result.activeCoordinatorScope === null
+          ? null
+          : {
+              appointment_id: result.activeCoordinatorScope.appointmentId,
+              programme_id: result.activeCoordinatorScope.programmeId,
+              programme_name: result.activeCoordinatorScope.programmeName,
+              academic_session_id:
+                result.activeCoordinatorScope.academicSessionId,
+              session_label: result.activeCoordinatorScope.academicSessionLabel,
+            },
+      mfa_required: result.mfaRequired,
+      mfa_verified: result.mfaVerified,
+      next_step:
+        mfaMandatory && !result.mfaVerified
+          ? "MFA_CHALLENGE_REQUIRED"
+          : null,
+      inactivity_timeout_minutes: result.inactivityTimeoutMinutes,
+      expires_at_utc: result.expiresAtUtc,
+    });
+  };
+
   const activate: RequestHandler = async (req, res) => {
     const body = getValidatedBody<ActivateRequestBody>(req);
 
@@ -196,6 +306,9 @@ export function createAuthController(deps: AuthControllerDeps): {
     login,
     logout,
     heartbeat,
+    mfaEnroll,
+    mfaVerify,
+    sessionContext,
     activate,
     requestPasswordReset,
     resetPassword,

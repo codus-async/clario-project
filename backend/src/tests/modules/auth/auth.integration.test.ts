@@ -18,6 +18,7 @@ import { PrismaClient } from "../../../generated/prisma/client.js";
 import { Argon2PasswordHasher } from "../../../infrastructure/auth/argon2-password-hasher.js";
 import { LocalCompromisedPasswordChecker } from "../../../infrastructure/auth/compromised-password-checker.js";
 import { PrismaAccountRepository } from "../../../infrastructure/auth/prisma-account.repository.js";
+import { PrismaMfaRepository } from "../../../infrastructure/auth/prisma-mfa.repository.js";
 import {
   PrismaInstitutionRepository,
   PrismaRoleAssignmentRepository,
@@ -29,6 +30,7 @@ import { RedisSessionStore } from "../../../infrastructure/auth/redis-session.st
 import { PayloadCipher } from "../../../infrastructure/security/payload-cipher.js";
 import { createAuthRouter } from "../../../modules/auth/auth.routes.js";
 import { hashSingleUseToken } from "../../../modules/auth/auth.token.js";
+import { generateTotpCode } from "../../../modules/auth/auth.totp.js";
 import { createRequireSession } from "../../../modules/auth/auth.middleware.js";
 import { AccountService } from "../../../modules/auth/auth.account.service.js";
 import { AuthService } from "../../../modules/auth/auth.service.js";
@@ -239,6 +241,7 @@ beforeAll(async () => {
       redis,
       testAuthConfig.protection,
     ),
+    mfa: new PrismaMfaRepository(db, new PayloadCipher(OUTBOX_KEY)),
   });
 
   const requireSession = createRequireSession(authService);
@@ -1062,5 +1065,310 @@ describe("F-64 account lifecycle (PostgreSQL + Redis)", () => {
       .send({ token: rawToken, password: "Another-Strong-Pass-88!" });
     expect(replay.status).toBe(400);
     expect(replay.body.error.code).toBe("VALIDATION_ERROR");
+  }, 120_000);
+});
+
+describe("F-65 end-to-end (PostgreSQL + Redis)", () => {
+  const MFA_EMAIL = "mfa.test@tena.edu.ng";
+  let mfaUserId: string;
+  let mfaAppointmentId: string;
+
+  beforeAll(async () => {
+    // A dedicated account holding three roles plus one coordinator
+    // appointment, so the challenge and the context switch both run against
+    // real rows without disturbing the accounts the F-64 tests assert on.
+    const user = await sql.query<{ id: string }>(
+      `INSERT INTO users (institution_id, is_platform_admin, full_name, email, institutional_id_number, account_status, password_hash)
+       VALUES ($1, false, 'MFA Test Account', $2, 'TENA/STU/9010', 'ACTIVE', $3)
+       RETURNING id`,
+      [institutionId, MFA_EMAIL, supervisorPasswordHash],
+    );
+    mfaUserId = firstRow(user.rows).id;
+
+    await sql.query(
+      `INSERT INTO user_role_assignments (institution_id, user_id, role_code, assigned_by_user_id)
+       VALUES ($1, $2, 'PROJECT_SUPERVISOR', $2),
+              ($1, $2, 'STUDENT', $2),
+              ($1, $2, 'PROJECT_COORDINATOR', $2)`,
+      [institutionId, mfaUserId],
+    );
+
+    const appointment = await sql.query<{ id: string }>(
+      `INSERT INTO coordinator_appointments (institution_id, user_id, programme_id, academic_session_id, appointed_by_user_id)
+       VALUES ($1, $2, $3, $4, $2) RETURNING id`,
+      [institutionId, mfaUserId, programmeId, academicSessionId],
+    );
+    mfaAppointmentId = firstRow(appointment.rows).id;
+  }, 60_000);
+
+  async function loginMfaUser(activeRole: RoleCode = RoleCode.PROJECT_SUPERVISOR) {
+    const response = await request(app)
+      .post("/api/v1/auth/login")
+      .set("X-Clario-Active-Role", activeRole)
+      .send({
+        identifier: MFA_EMAIL,
+        password: PASSWORD,
+        institutionCode: "TENA",
+      });
+    expect(response.status).toBe(200);
+    return {
+      cookie: cookieFrom(response),
+      sessionId: String(response.body.session_id),
+    };
+  }
+
+  async function runtimeState(sessionId: string): Promise<Record<string, unknown>> {
+    const raw = await redis.get(`clario:session:${sessionId}`);
+    expect(raw).not.toBeNull();
+    return JSON.parse(String(raw)) as Record<string, unknown>;
+  }
+
+  async function storedUser() {
+    const row = await db.users.findUnique({ where: { id: mfaUserId } });
+    expect(row).not.toBeNull();
+    return row as NonNullable<typeof row>;
+  }
+
+  it("enrolls and verifies against real PostgreSQL and Redis", async () => {
+    const { cookie, sessionId } = await loginMfaUser();
+
+    const enroll = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+    expect(enroll.status).toBe(201);
+    const secret = String(enroll.body.secret);
+    const codes = enroll.body.recovery_codes as string[];
+    expect(codes).toHaveLength(10);
+
+    // The seed is sealed with the account-bound AAD; the raw value never
+    // reaches the row, and the digests never carry the codes themselves.
+    const user = await storedUser();
+    expect(user.mfa_enrolled).toBe(true);
+    const envelope = user.mfa_secret_encrypted;
+    expect(envelope).toBeTruthy();
+    expect(envelope).not.toBe(secret);
+    const cipher = new PayloadCipher(OUTBOX_KEY);
+    expect(cipher.decrypt(String(envelope), `AUTH_MFA_TOTP|${mfaUserId}`)).toBe(
+      secret,
+    );
+    // The same envelope bound to another account fails to decrypt.
+    expect(() =>
+      cipher.decrypt(String(envelope), `AUTH_MFA_TOTP|${supervisorId}`),
+    ).toThrow();
+
+    const digests = user.mfa_recovery_codes_hash as unknown as string[];
+    expect(Array.isArray(digests)).toBe(true);
+    expect(digests).toHaveLength(10);
+    for (const code of codes) {
+      expect(digests).not.toContain(code);
+    }
+
+    // The session copy in Redis reflects the enrollment, not the challenge.
+    const enrolledState = await runtimeState(sessionId);
+    expect(enrolledState.mfaEnrolled).toBe(true);
+    expect(enrolledState.mfaVerified).toBe(false);
+
+    const verify = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: generateTotpCode(secret) });
+    expect(verify.status).toBe(200);
+    expect(verify.body.session_id).toBe(sessionId);
+    expect(verify.body.recovery_codes_remaining).toBe(10);
+
+    // Both copies of the session carry the verified flag.
+    const sessionRow = await db.user_sessions.findUnique({
+      where: { id: sessionId },
+    });
+    expect(sessionRow?.mfa_verified).toBe(true);
+    const verifiedState = await runtimeState(sessionId);
+    expect(verifiedState.mfaVerified).toBe(true);
+
+    const protectedResponse = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+    expect(protectedResponse.status).toBe(200);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
+  }, 120_000);
+
+  it("spends a recovery code exactly once at the database level", async () => {
+    const { cookie } = await loginMfaUser();
+
+    // Re-enroll while the challenge is outstanding: fresh codes replace the
+    // previous pair.
+    const enroll = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+    expect(enroll.status).toBe(201);
+    const codes = enroll.body.recovery_codes as string[];
+    const spentCode = codes[0] as string;
+
+    const first = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: spentCode });
+    expect(first.status).toBe(200);
+    expect(first.body.recovery_codes_remaining).toBe(9);
+    expect(
+      (await storedUser()).mfa_recovery_codes_hash as unknown as string[],
+    ).toHaveLength(9);
+
+    // The conditional write makes the replay a no-op: the stored digest
+    // array no longer contains the code, and it can never be spent twice.
+    const replay = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: spentCode });
+    expect(replay.status).toBe(400);
+    expect(replay.body.error.code).toBe("VALIDATION_ERROR");
+    expect(
+      (await storedUser()).mfa_recovery_codes_hash as unknown as string[],
+    ).toHaveLength(9);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
+  }, 120_000);
+
+  it("switches the active role and persists it in both stores", async () => {
+    const { cookie, sessionId } = await loginMfaUser();
+
+    const switched = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({ targetRole: RoleCode.STUDENT });
+    expect(switched.status).toBe(200);
+    expect(switched.body.session_id).toBe(sessionId);
+    expect(switched.body.active_role).toBe(RoleCode.STUDENT);
+    expect(switched.body.active_coordinator_scope).toBeNull();
+    expect(switched.body.next_step).toBeNull();
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.active_role).toBe(RoleCode.STUDENT);
+    expect(row?.active_coordinator_appointment_id).toBeNull();
+    expect(row?.inactivity_timeout_minutes).toBe(60);
+
+    const state = await runtimeState(sessionId);
+    expect(state.activeRole).toBe(RoleCode.STUDENT);
+
+    const protectedResponse = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+    expect(protectedResponse.status).toBe(200);
+    expect(protectedResponse.body.activeRole).toBe(RoleCode.STUDENT);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
+  }, 120_000);
+
+  it("binds a supervisor session to its coordinator appointment (BR-03)", async () => {
+    const { cookie, sessionId } = await loginMfaUser();
+
+    // The login selected the supervisor role, so no appointment list was
+    // loaded with the session: the switch must read it from PostgreSQL.
+    const before = await runtimeState(sessionId);
+    expect(before.coordinatorAppointments).toEqual([]);
+
+    const switched = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({
+        targetRole: RoleCode.PROJECT_COORDINATOR,
+        coordinatorAppointmentId: mfaAppointmentId,
+      });
+    expect(switched.status).toBe(200);
+    expect(switched.body.active_role).toBe(RoleCode.PROJECT_COORDINATOR);
+    expect(switched.body.active_coordinator_scope?.appointment_id).toBe(
+      mfaAppointmentId,
+    );
+    expect(switched.body.inactivity_timeout_minutes).toBe(30);
+    // Switching into a mandatory-MFA role flags the outstanding challenge.
+    expect(switched.body.next_step).toBe("MFA_CHALLENGE_REQUIRED");
+
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.active_role).toBe(RoleCode.PROJECT_COORDINATOR);
+    expect(row?.active_coordinator_appointment_id).toBe(mfaAppointmentId);
+    expect(row?.inactivity_timeout_minutes).toBe(30);
+
+    const state = await runtimeState(sessionId);
+    expect(
+      (state.activeCoordinatorScope as { appointmentId: string } | null)
+        ?.appointmentId,
+    ).toBe(mfaAppointmentId);
+    expect(
+      (state.coordinatorAppointments as Array<{ appointmentId: string }>).map(
+        (scope) => scope.appointmentId,
+      ),
+    ).toEqual([mfaAppointmentId]);
+
+    // `requireSession` still admits the request; the MFA gate is the
+    // separate `createRequireMfaVerified` layer.
+    const protectedResponse = await request(app)
+      .get("/protected")
+      .set("Cookie", cookie);
+    expect(protectedResponse.status).toBe(200);
+    expect(protectedResponse.body.activeRole).toBe(RoleCode.PROJECT_COORDINATOR);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
+  }, 120_000);
+
+  it("rejects an appointment the account does not hold", async () => {
+    const { cookie, sessionId } = await loginMfaUser();
+
+    const response = await request(app)
+      .put("/api/v1/auth/session/context")
+      .set("Cookie", cookie)
+      .send({
+        targetRole: RoleCode.PROJECT_COORDINATOR,
+        coordinatorAppointmentId: "77777777-7777-4777-8777-777777777777",
+      });
+    expect(response.status).toBe(403);
+    expect(response.body.error.code).toBe("OUT_OF_ASSIGNMENT_SCOPE");
+
+    // Neither copy of the session moved.
+    const row = await db.user_sessions.findUnique({ where: { id: sessionId } });
+    expect(row?.active_role).toBe(RoleCode.PROJECT_SUPERVISOR);
+    expect(row?.active_coordinator_appointment_id).toBeNull();
+    const state = await runtimeState(sessionId);
+    expect(state.activeRole).toBe(RoleCode.PROJECT_SUPERVISOR);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
+  }, 120_000);
+
+  it("rejects a stale TOTP code without spending anything", async () => {
+    const { cookie } = await loginMfaUser();
+    const enroll = await request(app)
+      .post("/api/v1/auth/mfa/enroll")
+      .set("Cookie", cookie)
+      .send({});
+    expect(enroll.status).toBe(201);
+    const secret = String(enroll.body.secret);
+
+    const nowSeconds = Math.floor(Date.now() / 1_000);
+    const current = generateTotpCode(secret, nowSeconds);
+    let stale = generateTotpCode(secret, nowSeconds - 3_600);
+    if (stale === current) {
+      stale = generateTotpCode(secret, nowSeconds - 7_200);
+    }
+
+    const rejected = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: stale });
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error.code).toBe("VALIDATION_ERROR");
+    expect(rejected.body.error.field_errors?.[0]?.field).toBe("totpCode");
+    expect(
+      (await storedUser()).mfa_recovery_codes_hash as unknown as string[],
+    ).toHaveLength(10);
+
+    // The session stays valid and the correct code still works.
+    const accepted = await request(app)
+      .post("/api/v1/auth/mfa/verify")
+      .set("Cookie", cookie)
+      .send({ totpCode: current });
+    expect(accepted.status).toBe(200);
+
+    await request(app).post("/api/v1/auth/logout").set("Cookie", cookie);
   }, 120_000);
 });

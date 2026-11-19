@@ -4,6 +4,10 @@ import { describe, expect, it } from "vitest";
 import { AppError } from "../../../errors/app-error.js";
 import { ERROR_CODES } from "../../../errors/error-codes.js";
 import {
+  generateTotpCode,
+  hashRecoveryCode,
+} from "../../../modules/auth/auth.totp.js";
+import {
   LOGIN_PAYLOAD,
   PASSWORD,
   USER_ID,
@@ -1161,6 +1165,646 @@ describe("AuthService.assertMfaSatisfied", () => {
     expectThrownCode(
       () => fixture.service.assertMfaSatisfied(context),
       ERROR_CODES.MFA_CHALLENGE_REQUIRED,
+    );
+  });
+});
+
+// ===========================================================================
+// F-65: MFA enrollment, challenge, and session context switching
+// (FR-224, SEC-06, FR-047, BR-03)
+// ===========================================================================
+
+/** The IP every F-65 challenge in these tests is attempted from. */
+const CHALLENGE_IP = LOGIN_PAYLOAD.ip;
+
+/**
+ * A live, unchallenged session that has just been enrolled: the state every
+ * MFA-challenge test starts from.
+ */
+async function enrolledSession(fixture: FakeAuthFixture) {
+  const login = await fixture.service.login(LOGIN_PAYLOAD);
+  const enrollment = await fixture.service.enrollMfa(login.sessionId);
+  return { login, enrollment };
+}
+
+/** A 6-digit code that is guaranteed not to be the current one. */
+function staleTotpCode(secret: string): string {
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const current = generateTotpCode(secret, nowSeconds);
+  for (const offsetSeconds of [3_600, 7_200, 86_400, 604_800]) {
+    const candidate = generateTotpCode(secret, nowSeconds - offsetSeconds);
+    if (candidate !== current) {
+      return candidate;
+    }
+  }
+  throw new Error("could not derive a stale TOTP code");
+}
+
+function rowOf(fixture: FakeAuthFixture, sessionId: string) {
+  const row = fixture.sessions.rows.get(sessionId);
+  expect(row, "session row must exist").toBeDefined();
+  return row as NonNullable<typeof row>;
+}
+
+describe("AuthService.enrollMfa", () => {
+  it("binds a seed and ten recovery codes, returning them exactly once", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+
+    expect(enrollment.secret).toMatch(/^[A-Z2-7]{32}$/);
+    expect(enrollment.provisioningUri.startsWith("otpauth://totp/")).toBe(true);
+    expect(enrollment.provisioningUri).toContain(`secret=${enrollment.secret}`);
+    expect(enrollment.recoveryCodes).toHaveLength(10);
+    expect(new Set(enrollment.recoveryCodes).size).toBe(10);
+    for (const code of enrollment.recoveryCodes) {
+      expect(code).toMatch(/^[0-9A-F]{4}(-[0-9A-F]{4}){3}$/);
+    }
+
+    // The digests — never the codes — are what storage keeps.
+    expect(fixture.mfa.digestsOf(USER_ID)).toHaveLength(10);
+    expect(fixture.mfa.digestsOf(USER_ID)).toContain(
+      hashRecoveryCode(enrollment.recoveryCodes[0] as string),
+    );
+
+    // Enrollment flips the session's convenience copy only: the challenge
+    // itself has not been answered yet.
+    expect(stateOf(fixture, login.sessionId).mfaEnrolled).toBe(true);
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(false);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("issues a fresh pair when enrollment repeats before verification", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    const first = await fixture.service.enrollMfa(login.sessionId);
+    const second = await fixture.service.enrollMfa(login.sessionId);
+
+    expect(second.secret).not.toBe(first.secret);
+    expect(second.recoveryCodes).not.toEqual(first.recoveryCodes);
+    // The first pair is voided, not accumulated.
+    expect(fixture.mfa.digestsOf(USER_ID)).toHaveLength(10);
+  });
+
+  it("refuses to re-bind the authenticator after the challenge is answered", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    await fixture.service.verifyMfa({
+      sessionId: login.sessionId,
+      code: generateTotpCode(enrollment.secret),
+      ip: CHALLENGE_IP,
+    });
+
+    await expectAppError(
+      () => fixture.service.enrollMfa(login.sessionId),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+  });
+
+  it("reports a vanished or deactivated account as UNAUTHENTICATED", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.mfa.enrollReturnsFalse = true;
+
+    await expectAppError(
+      () => fixture.service.enrollMfa(login.sessionId),
+      ERROR_CODES.UNAUTHENTICATED,
+    );
+  });
+
+  it("fails closed with SERVICE_UNAVAILABLE when the write fails", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.mfa.enrollShouldFail = true;
+
+    await expectAppError(
+      () => fixture.service.enrollMfa(login.sessionId),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(fixture.mfa.digestsOf(USER_ID)).toBeNull();
+  });
+
+  it("fails closed when the session's runtime copy cannot be written", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+    fixture.sessionStore.setShouldFail = true;
+
+    await expectAppError(
+      () => fixture.service.enrollMfa(login.sessionId),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(stateOf(fixture, login.sessionId).mfaEnrolled).toBe(false);
+  });
+
+  it("rejects an unknown session", async () => {
+    const fixture = seededFixture();
+
+    await expectAppError(
+      () =>
+        fixture.service.enrollMfa(
+          "00000000-0000-4000-8000-000000000000"
+        ),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    );
+  });
+});
+
+describe("AuthService.verifyMfa", () => {
+  it("accepts a current TOTP code and verifies the session in both copies", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+
+    const result = await fixture.service.verifyMfa({
+      sessionId: login.sessionId,
+      code: generateTotpCode(enrollment.secret),
+      ip: CHALLENGE_IP,
+    });
+
+    expect(result.sessionId).toBe(login.sessionId);
+    expect(result.recoveryCodesRemaining).toBe(10);
+    expect(result.expiresAtUtc).toBe(rowOf(fixture, login.sessionId).expiresAt.toISOString());
+    expect(result.inactivityTimeoutMinutes).toBe(
+      rowOf(fixture, login.sessionId).inactivityTimeoutMinutes,
+    );
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(true);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(true);
+    expect(fixture.protection.successes).toContainEqual({
+      ip: CHALLENGE_IP,
+      identifier: USER_ID,
+    });
+  });
+
+  it("rejects a stale code with a 400 field error and records the failure", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+
+    const error = await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: staleTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+
+    expect(error.status).toBe(400);
+    expect(
+      error.fieldErrors?.some((fieldError) => fieldError.field === "totpCode"),
+    ).toBe(true);
+    expect(fixture.protection.failures).toContainEqual({
+      ip: CHALLENGE_IP,
+      identifier: USER_ID,
+    });
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(false);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("accepts a recovery code, spends it, and reports the remainder", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    const spentCode = enrollment.recoveryCodes[0] as string;
+
+    const result = await fixture.service.verifyMfa({
+      sessionId: login.sessionId,
+      code: spentCode,
+      ip: CHALLENGE_IP,
+    });
+
+    expect(result.recoveryCodesRemaining).toBe(9);
+    const digests = fixture.mfa.digestsOf(USER_ID) ?? [];
+    expect(digests).toHaveLength(9);
+    expect(digests).not.toContain(hashRecoveryCode(spentCode));
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(true);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(true);
+  });
+
+  it("rejects a well-formed code that was never issued", async () => {
+    const fixture = seededFixture();
+    const { login } = await enrolledSession(fixture);
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: "DEAD-BEEF-0000-1111",
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+    expect(fixture.mfa.digestsOf(USER_ID)).toHaveLength(10);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("cannot spend the same recovery code twice", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    const spentCode = enrollment.recoveryCodes[0] as string;
+
+    await fixture.service.verifyMfa({
+      sessionId: login.sessionId,
+      code: spentCode,
+      ip: CHALLENGE_IP,
+    });
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: spentCode,
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+    expect(fixture.mfa.digestsOf(USER_ID)).toHaveLength(9);
+  });
+
+  it("requires enrollment before the challenge can be verified", async () => {
+    const fixture = seededFixture();
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: "048291",
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.MFA_ENROLLMENT_REQUIRED,
+    );
+  });
+
+  it("fails closed when the stored seed cannot be read", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    fixture.mfa.corruptSecretFor.add(USER_ID);
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: generateTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    // Nothing was consumed and no failure was charged to the user.
+    expect(fixture.mfa.digestsOf(USER_ID)).toHaveLength(10);
+    expect(fixture.protection.failures).toHaveLength(0);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("fails closed when the enrollment cannot be read at all", async () => {
+    const fixture = seededFixture();
+    const { login } = await enrolledSession(fixture);
+    fixture.mfa.findShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: "048291",
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+  });
+
+  it("is refused while the account is locked out", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    fixture.protection.locked = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: generateTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.ACCOUNT_TEMPORARILY_LOCKED,
+    );
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("never verifies the session when the remaining-count read fails", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    fixture.mfa.countShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: generateTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(false);
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("fails closed when the session row cannot be written", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    fixture.sessions.updateContextShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: generateTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("rolls the session row back when the runtime copy cannot be written", async () => {
+    const fixture = seededFixture();
+    const { login, enrollment } = await enrolledSession(fixture);
+    fixture.sessionStore.setShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: login.sessionId,
+          code: generateTotpCode(enrollment.secret),
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    // The row was upgraded first and must now match the untouched Redis
+    // copy again, or the next request would fail the cross-check.
+    expect(rowOf(fixture, login.sessionId).mfaVerified).toBe(false);
+    expect(stateOf(fixture, login.sessionId).mfaVerified).toBe(false);
+  });
+
+  it("rejects an unknown session", async () => {
+    const fixture = seededFixture();
+
+    await expectAppError(
+      () =>
+        fixture.service.verifyMfa({
+          sessionId: "00000000-0000-4000-8000-000000000000",
+          code: "048291",
+          ip: CHALLENGE_IP,
+        }),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
+    );
+  });
+});
+
+describe("AuthService.updateSessionContext", () => {
+  const FIRST_APPOINTMENT = "33333333-3333-4333-8333-333333333333";
+  const SECOND_APPOINTMENT = "99999999-9999-4999-8999-999999999999";
+
+  /** A supervisor/coordinator account logged in under the supervisor role. */
+  async function supervisorSession() {
+    const fixture = seededFixture([
+      RoleCode.PROJECT_SUPERVISOR,
+      RoleCode.PROJECT_COORDINATOR,
+      RoleCode.STUDENT,
+    ]);
+    seedCoordinatorScopes(fixture, [
+      coordinatorScope({ appointmentId: FIRST_APPOINTMENT }),
+      coordinatorScope({ appointmentId: SECOND_APPOINTMENT }),
+    ]);
+    const login = await fixture.service.login({
+      ...LOGIN_PAYLOAD,
+      activeRoleHeader: RoleCode.PROJECT_SUPERVISOR,
+    });
+    return { fixture, login };
+  }
+
+  it("switches the active role and both copies of the session", async () => {
+    const { fixture, login } = await supervisorSession();
+
+    const result = await fixture.service.updateSessionContext({
+      sessionId: login.sessionId,
+      targetRole: RoleCode.STUDENT,
+    });
+
+    expect(result.activeRole).toBe(RoleCode.STUDENT);
+    expect(result.activeCoordinatorScope).toBeNull();
+    expect(stateOf(fixture, login.sessionId).activeRole).toBe(RoleCode.STUDENT);
+    expect(rowOf(fixture, login.sessionId).activeRole).toBe(RoleCode.STUDENT);
+    // The idle window follows the *target* role (F-64 §7).
+    expect(result.inactivityTimeoutMinutes).toBe(
+      fixture.config.inactivityTimeoutMinutesByRole[RoleCode.STUDENT],
+    );
+    expect(result.inactivityTimeoutMinutes).toBe(
+      stateOf(fixture, login.sessionId).inactivityTimeoutMinutes,
+    );
+    expect(result.inactivityTimeoutMinutes).toBe(
+      rowOf(fixture, login.sessionId).inactivityTimeoutMinutes,
+    );
+  });
+
+  it("binds the coordinator role to one appointment and persists the scopes", async () => {
+    const { fixture, login } = await supervisorSession();
+
+    const result = await fixture.service.updateSessionContext({
+      sessionId: login.sessionId,
+      targetRole: RoleCode.PROJECT_COORDINATOR,
+      coordinatorAppointmentId: SECOND_APPOINTMENT,
+    });
+
+    expect(result.activeRole).toBe(RoleCode.PROJECT_COORDINATOR);
+    expect(result.activeCoordinatorScope?.appointmentId).toBe(
+      SECOND_APPOINTMENT,
+    );
+    expect(rowOf(fixture, login.sessionId).activeCoordinatorAppointmentId).toBe(
+      SECOND_APPOINTMENT,
+    );
+    // The idle window follows the target role: coordinator is 30 minutes,
+    // supervisor (the login role) is 60.
+    expect(result.inactivityTimeoutMinutes).toBe(
+      fixture.config.inactivityTimeoutMinutesByRole[
+        RoleCode.PROJECT_COORDINATOR
+      ],
+    );
+    expect(result.inactivityTimeoutMinutes).not.toBe(
+      fixture.config.inactivityTimeoutMinutesByRole[
+        RoleCode.PROJECT_SUPERVISOR
+      ],
+    );
+    // The fresh appointment list travels with the switch, so the next
+    // revalidation compares against what the account holds *now*.
+    expect(
+      stateOf(fixture, login.sessionId).coordinatorAppointments.map(
+        (scope) => scope.appointmentId,
+      ),
+    ).toEqual([FIRST_APPOINTMENT, SECOND_APPOINTMENT]);
+  });
+
+  it("clears the coordinator binding when switching away from the role", async () => {
+    const fixture = seededFixture([
+      RoleCode.PROJECT_COORDINATOR,
+      RoleCode.STUDENT,
+    ]);
+    seedCoordinatorScopes(fixture, [coordinatorScope()]);
+    const login = await fixture.service.login({
+      ...LOGIN_PAYLOAD,
+      activeRoleHeader: RoleCode.PROJECT_COORDINATOR,
+    });
+    expect(stateOf(fixture, login.sessionId).activeCoordinatorScope).not.toBeNull();
+
+    const result = await fixture.service.updateSessionContext({
+      sessionId: login.sessionId,
+      targetRole: RoleCode.STUDENT,
+    });
+
+    expect(result.activeCoordinatorScope).toBeNull();
+    expect(rowOf(fixture, login.sessionId).activeCoordinatorAppointmentId).toBe(
+      null,
+    );
+    expect(stateOf(fixture, login.sessionId).activeCoordinatorScope).toBeNull();
+  });
+
+  it("requires an appointment when the target role is the coordinator", async () => {
+    const { fixture, login } = await supervisorSession();
+
+    const error = await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.PROJECT_COORDINATOR,
+        }),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+
+    expect(
+      error.fieldErrors?.some(
+        (fieldError) => fieldError.field === "coordinatorAppointmentId",
+      ),
+    ).toBe(true);
+    expect(rowOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+  });
+
+  it("rejects an appointment the account does not hold", async () => {
+    const { fixture, login } = await supervisorSession();
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.PROJECT_COORDINATOR,
+          coordinatorAppointmentId: "77777777-7777-4777-8777-777777777777",
+        }),
+      ERROR_CODES.OUT_OF_ASSIGNMENT_SCOPE,
+    );
+    expect(stateOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+    expect(rowOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+  });
+
+  it("rejects a role the account does not hold", async () => {
+    const fixture = seededFixture([RoleCode.PROJECT_SUPERVISOR]);
+    const login = await fixture.service.login(LOGIN_PAYLOAD);
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.PLATFORM_ADMIN,
+        }),
+      ERROR_CODES.OUT_OF_ASSIGNMENT_SCOPE,
+    );
+  });
+
+  it("rejects an appointment id supplied for a non-coordinator target", async () => {
+    const { fixture, login } = await supervisorSession();
+
+    const error = await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.STUDENT,
+          coordinatorAppointmentId: FIRST_APPOINTMENT,
+        }),
+      ERROR_CODES.VALIDATION_ERROR,
+    );
+
+    expect(
+      error.fieldErrors?.some(
+        (fieldError) => fieldError.field === "coordinatorAppointmentId",
+      ),
+    ).toBe(true);
+  });
+
+  it("fails closed when the appointment list cannot be loaded", async () => {
+    const { fixture, login } = await supervisorSession();
+    fixture.roles.findCoordinatorScopesShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.PROJECT_COORDINATOR,
+          coordinatorAppointmentId: FIRST_APPOINTMENT,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(stateOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+  });
+
+  it("fails closed when the session row cannot be written", async () => {
+    const { fixture, login } = await supervisorSession();
+    fixture.sessions.updateContextShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.STUDENT,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    expect(stateOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+  });
+
+  it("rolls the session row back when the runtime copy cannot be written", async () => {
+    const { fixture, login } = await supervisorSession();
+    fixture.sessionStore.setShouldFail = true;
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: login.sessionId,
+          targetRole: RoleCode.STUDENT,
+        }),
+      ERROR_CODES.SERVICE_UNAVAILABLE,
+    );
+    // Row and Redis copy agree again, so the cross-check stays green.
+    expect(rowOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+    expect(stateOf(fixture, login.sessionId).activeRole).toBe(
+      RoleCode.PROJECT_SUPERVISOR,
+    );
+  });
+
+  it("rejects an unknown session", async () => {
+    const { fixture } = await supervisorSession();
+
+    await expectAppError(
+      () =>
+        fixture.service.updateSessionContext({
+          sessionId: "00000000-0000-4000-8000-000000000000",
+          targetRole: RoleCode.STUDENT,
+        }),
+      ERROR_CODES.SESSION_EXPIRED_OR_REVOKED,
     );
   });
 });
