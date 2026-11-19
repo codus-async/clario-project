@@ -7,7 +7,13 @@ import { ERROR_CODES } from "../../errors/error-codes.js";
 import { SESSION_COOKIE_NAME } from "./auth.config.js";
 import type { AuthService } from "./auth.service.js";
 
-function readSessionCookie(cookieHeader: string | undefined): string | undefined {
+/**
+ * Reads the opaque session id from the `clario_sid` cookie (F-64, REST §2.1).
+ * Exported for the F-66 PEP, which resolves the same credential set.
+ */
+export function readSessionCookie(
+  cookieHeader: string | undefined,
+): string | undefined {
   if (cookieHeader === undefined) {
     return undefined;
   }
@@ -18,7 +24,14 @@ function readSessionCookie(cookieHeader: string | undefined): string | undefined
   return value;
 }
 
-function readBearerSession(authorization: string | undefined): string | undefined {
+/**
+ * Reads the session id from `Authorization: Bearer <session-id>`. Throws
+ * `UNAUTHENTICATED` for a malformed header; the F-66 PEP normalizes that to
+ * `UNAUTHORIZED_SESSION` on protected routes.
+ */
+export function readBearerSession(
+  authorization: string | undefined,
+): string | undefined {
   if (authorization === undefined) {
     return undefined;
   }
